@@ -18,6 +18,21 @@ if (!process.env.APP_URL) {
 const BETTER_AUTH_SECRET = process.env.BETTER_AUTH_SECRET;
 const BETTER_AUTH_URL = process.env.APP_URL;
 
+// Cross-subdomain cookies stamp `Domain=<APP_URL host>` on the session cookie.
+// That is only valid for a real dotted domain: browsers reject a single-label
+// Domain (e.g. `metamcp`) or a bare IP, silently dropping the session so login
+// never persists. Enable it only when APP_URL's host is a dotted, non-IP name;
+// for single-label hosts (metamcp, localhost) issue a host-only cookie instead.
+const enableCrossSubDomainCookies = (() => {
+  try {
+    const host = new URL(BETTER_AUTH_URL).hostname;
+    const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(":");
+    return host.includes(".") && !isIp;
+  } catch {
+    return false;
+  }
+})();
+
 // Helper function to create basic auth middleware
 const createBasicAuthCheckMiddleware = () => {
   return async (request: unknown) => {
@@ -139,7 +154,7 @@ export const auth = betterAuth({
   },
   advanced: {
     crossSubDomainCookies: {
-      enabled: true,
+      enabled: enableCrossSubDomainCookies,
     },
   },
   logger: {

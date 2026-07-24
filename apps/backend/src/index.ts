@@ -127,7 +127,7 @@ async function start(): Promise<void> {
     logger.error("Auto-nuke: unexpected error (ignored):", err);
   }
 
-  app.listen(12009, async () => {
+  app.listen(12009, process.env.METAMCP_BIND_HOST || "127.0.0.1", async () => {
     console.log(`Server is running on port 12009`);
     console.log(`Auth routes available at: http://localhost:12009/api/auth`);
     console.log(

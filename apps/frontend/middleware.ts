@@ -42,6 +42,21 @@ function getLocale(request: NextRequest): string {
 export async function middleware(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
 
+  // Next's `request.url` resolves to the server's bound host (e.g. localhost),
+  // not the public Host the browser used. Redirects built from it jump origin,
+  // which drops host-only session cookies and bounces the user to a login page
+  // on the wrong host. Build redirect URLs from the incoming Host header
+  // instead (honoring nginx's x-forwarded-* in front of the app).
+  const redirectProto =
+    request.headers.get("x-forwarded-proto") ||
+    request.nextUrl.protocol.replace(/:$/, "") ||
+    "http";
+  const redirectHost =
+    request.headers.get("x-forwarded-host") || request.headers.get("host");
+  const redirectBase = redirectHost
+    ? `${redirectProto}://${redirectHost}`
+    : request.url;
+
   // Skip middleware for static files and API routes
   if (
     pathname.startsWith("/_next") ||
@@ -79,7 +94,7 @@ export async function middleware(request: NextRequest) {
   } else {
     // Redirect to the appropriate locale
     locale = getLocale(request);
-    const newUrl = new URL(`/${locale}${pathname}`, request.url);
+    const newUrl = new URL(`/${locale}${pathname}`, redirectBase);
     // Preserve query parameters during redirect
     newUrl.search = request.nextUrl.search;
     return NextResponse.redirect(newUrl);
@@ -115,7 +130,7 @@ export async function middleware(request: NextRequest) {
 
     if (!session) {
       // Redirect to login if not authenticated (with locale)
-      const loginUrl = new URL(`/${locale}/login`, request.url);
+      const loginUrl = new URL(`/${locale}/login`, redirectBase);
       loginUrl.searchParams.set("callbackUrl", pathnameWithoutLocale);
       return NextResponse.redirect(loginUrl);
     }
@@ -124,7 +139,7 @@ export async function middleware(request: NextRequest) {
   } catch (error) {
     console.error("Auth middleware error:", error);
     // On error, redirect to login (with locale)
-    const loginUrl = new URL(`/${locale}/login`, request.url);
+    const loginUrl = new URL(`/${locale}/login`, redirectBase);
     loginUrl.searchParams.set("callbackUrl", pathnameWithoutLocale);
     return NextResponse.redirect(loginUrl);
   }

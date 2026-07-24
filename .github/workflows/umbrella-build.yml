@@ -1,9 +1,9 @@
 name: Umbrella — Build & Push (umbrella branch)
 
-# Umbrella IT Group fork — see UMBRELLA_FORK.md.
+# danbryan/metamcp fork — see UMBRELLA_FORK.md.
 # Builds and publishes the deployable line on every push to `umbrella`.
-# Image lands at ghcr.io/umbrella-it-group/metamcp:<sha> + :latest.
-# Watchtower on mcp-host-prod (scope=umbrella) picks up :latest within ~5 min.
+# Image name derives from the repo, so it lands at
+# ghcr.io/${{ github.repository }} (i.e. ghcr.io/danbryan/metamcp):<sha> + :latest.
 #
 # Also runs build-only (no login, no push, no tags) on PRs targeting
 # `umbrella` — this is the only build check a PR gets before merge. Until

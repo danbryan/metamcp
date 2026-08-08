@@ -337,6 +337,119 @@ const cleanupSession = async (
 };
 
 /**
+ * Suspend an idle session: close the in-memory transport and tear down the
+ * pooled MetaMCP server (which recycles one backend connection per server
+ * into the idle pool and destroys the rest, killing their stdio child
+ * processes), but KEEP the persisted `mcp_sessions` row.
+ *
+ * This is the difference from `cleanupSession` above, and it is what makes
+ * reaping safe: most harness consumers (Claude Code, Codex) never send the
+ * DELETE this router relies on for teardown, they just exit. Their session's
+ * child processes then live until the next metamcp restart. A suspended
+ * session's consumer, if it does come back, misses the in-memory map and
+ * flows through `recoverPersistedSession`, which rebuilds the transport and
+ * backend connections on demand from the kept row. Consumers that are truly
+ * gone cost nothing further; consumers that return pay one rebuild.
+ */
+const suspendSession = async (
+  sessionId: string,
+  transport?: StreamableHTTPServerTransport,
+) => {
+  logger.info(`Suspending idle StreamableHTTP session ${sessionId}`);
+
+  const sessionTransport = transport || sessionManager.getSession(sessionId);
+
+  // Drop from the manager first so a request racing this suspend takes the
+  // lazy-recovery path instead of grabbing a transport mid-close.
+  sessionManager.removeSession(sessionId);
+
+  if (sessionTransport) {
+    try {
+      await sessionTransport.close();
+    } catch (error) {
+      logger.warn(
+        `Error closing transport while suspending session ${sessionId}:`,
+        error,
+      );
+    }
+  }
+
+  try {
+    await metaMcpServerPool.cleanupSession(sessionId);
+  } catch (error) {
+    logger.error(
+      `Error cleaning up pool state while suspending session ${sessionId}:`,
+      error,
+    );
+  }
+
+  logger.info(
+    `Session ${sessionId} suspended after inactivity; lazy recovery remains available.`,
+  );
+};
+
+/**
+ * Idle-session reaper. Sweeps every `MCP_SESSION_IDLE_REAP_MS / 2` (capped
+ * at 5 min) and suspends sessions with no activity for
+ * `MCP_SESSION_IDLE_REAP_MS` (default 30 min). Set to 0 to disable.
+ *
+ * This coexists with the SESSION_LIFETIME cleanup timer below: that one is
+ * a hard TTL that fully deletes sessions (including the recovery row) and
+ * defaults to off (null lifetime). The reaper only detaches resources and
+ * is safe to run against persistent sessions.
+ */
+function getIdleReapMs(): number {
+  const raw = process.env.MCP_SESSION_IDLE_REAP_MS;
+  const defaultMs = 30 * 60 * 1000;
+  if (!raw) return defaultMs;
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    logger.warn(
+      `MCP_SESSION_IDLE_REAP_MS=${raw} invalid; falling back to default ${defaultMs}ms.`,
+    );
+    return defaultMs;
+  }
+  if (parsed === 0) return 0;
+  if (parsed < 60_000) {
+    logger.warn(
+      `MCP_SESSION_IDLE_REAP_MS=${raw} is below the 60000ms floor; using 60000.`,
+    );
+    return 60_000;
+  }
+  return parsed;
+}
+
+let idleSessionReaperTimer: NodeJS.Timeout | null = null;
+
+export function startIdleSessionReaper(): void {
+  if (idleSessionReaperTimer) return;
+  const idleMs = getIdleReapMs();
+  if (idleMs === 0) {
+    logger.info("MCP_SESSION_IDLE_REAP_MS=0; idle-session reaper disabled.");
+    return;
+  }
+  const intervalMs = Math.min(Math.floor(idleMs / 2), 5 * 60 * 1000);
+  idleSessionReaperTimer = setInterval(() => {
+    void sessionManager.cleanupIdleSessions(idleMs, async (sessionId, transport) =>
+      suspendSession(sessionId, transport),
+    );
+  }, intervalMs);
+  if (idleSessionReaperTimer.unref) idleSessionReaperTimer.unref();
+  logger.info(
+    `Idle-session reaper armed (idle_ms=${idleMs}, sweep_interval_ms=${intervalMs}).`,
+  );
+}
+
+export function stopIdleSessionReaper(): void {
+  if (idleSessionReaperTimer) {
+    clearInterval(idleSessionReaperTimer);
+    idleSessionReaperTimer = null;
+  }
+}
+
+startIdleSessionReaper();
+
+/**
  * Periodic pruner for the `mcp_sessions` table. Runs on boot + every
  * `MCP_SESSION_PRUNER_INTERVAL_MS` (default 24h). Deletes rows whose
  * `last_seen_at` is older than `MCP_SESSION_TTL_DAYS` days (default 7).
@@ -487,6 +600,7 @@ streamableHttpRouter.get(
         }
       }
       logger.info(`Handling GET for session ${sessionId}`);
+      sessionManager.touchSession(sessionId);
       await handleRequestWithUserContext(authReq, transport, req, res);
     } catch (error) {
       logger.error("Error in public endpoint /mcp route:", error);
@@ -709,6 +823,7 @@ streamableHttpRouter.post(
           }
         }
         logger.info(`Handling POST for session ${sessionId}`);
+        sessionManager.touchSession(sessionId);
         await handleRequestWithUserContext(authReq, transport, req, res);
       } catch (error) {
         logger.error("Error in public endpoint /mcp route:", error);

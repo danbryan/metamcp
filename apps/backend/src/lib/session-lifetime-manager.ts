@@ -6,9 +6,14 @@ export interface SessionLifetimeManager<T> {
   addSession(sessionId: string, session: T): void;
   removeSession(sessionId: string): void;
   getSession(sessionId: string): T | undefined;
+  touchSession(sessionId: string): void;
   getAllSessions(): Map<string, T>;
   getSessionAge(sessionId: string): number | undefined;
   isSessionExpired(sessionId: string): Promise<boolean>;
+  cleanupIdleSessions(
+    idleMs: number,
+    cleanupCallback: (sessionId: string, session: T) => Promise<void>,
+  ): Promise<void>;
   cleanupExpiredSessions(
     cleanupCallback: (sessionId: string, session: T) => Promise<void>,
   ): Promise<void>;
@@ -43,6 +48,15 @@ export class SessionLifetimeManagerImpl<T>
 
   getSession(sessionId: string): T | undefined {
     return this.sessions.get(sessionId);
+  }
+
+  // Refresh the session's timestamp so it reads as recently used. With the
+  // idle reaper, the timestamp means "last activity", not "created at" —
+  // callers touch on every request they route to the session's transport.
+  touchSession(sessionId: string): void {
+    if (this.sessions.has(sessionId)) {
+      this.sessionTimestamps.set(sessionId, Date.now());
+    }
   }
 
   getAllSessions(): Map<string, T> {
@@ -107,6 +121,43 @@ export class SessionLifetimeManagerImpl<T>
         error,
       );
     }
+  }
+
+  // Sweep sessions whose last activity is older than idleMs and hand each to
+  // the callback. Unlike cleanupExpiredSessions this ignores the configured
+  // SESSION_LIFETIME entirely: that setting is a hard TTL owned by the
+  // operator, while this sweep is an inactivity reaper whose callback is
+  // expected to leave the session recoverable (see streamable-http.ts's
+  // suspendSession).
+  async cleanupIdleSessions(
+    idleMs: number,
+    cleanupCallback: (sessionId: string, session: T) => Promise<void>,
+  ): Promise<void> {
+    const now = Date.now();
+    const idleSessions: Array<{ sessionId: string; session: T }> = [];
+
+    for (const [sessionId, timestamp] of this.sessionTimestamps.entries()) {
+      if (now - timestamp > idleMs) {
+        const session = this.sessions.get(sessionId);
+        if (session) {
+          idleSessions.push({ sessionId, session });
+        }
+      }
+    }
+
+    if (idleSessions.length === 0) {
+      return;
+    }
+
+    logger.info(
+      `Suspending ${idleSessions.length} idle ${this.name} session(s): ${idleSessions.map((s) => s.sessionId).join(", ")}`,
+    );
+
+    await Promise.allSettled(
+      idleSessions.map(({ sessionId, session }) =>
+        cleanupCallback(sessionId, session),
+      ),
+    );
   }
 
   startCleanupTimer(

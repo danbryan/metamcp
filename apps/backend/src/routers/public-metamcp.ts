@@ -8,6 +8,7 @@ import { openApiRouter } from "./public-metamcp/openapi";
 import adminRouter from "./public-metamcp/admin";
 import sseRouter from "./public-metamcp/sse";
 import streamableHttpRouter from "./public-metamcp/streamable-http";
+import metaRouter from "./public-metamcp/meta";
 
 const publicEndpointsRouter = express.Router();
 
@@ -34,6 +35,9 @@ publicEndpointsRouter.use((req, res, next) => {
   }
   next();
 });
+
+// Meta-tool variant must mount first so /:name/meta/mcp is not shadowed
+publicEndpointsRouter.use(metaRouter);
 
 // Use StreamableHTTP router for /mcp routes
 publicEndpointsRouter.use(streamableHttpRouter);

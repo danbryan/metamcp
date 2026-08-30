@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,9 +66,21 @@ static int run_child(const char *launcher) {
 }
 
 int main(void) {
+    char launcher_path[PATH_MAX];
     const char *launcher = getenv("METAMCP_HOST_LAUNCHER");
     if (launcher == NULL || launcher[0] == '\0') {
-        launcher = "/Users/danb/Library/Application Support/metamcp/run.sh";
+        const char *home = getenv("HOME");
+        if (home == NULL || home[0] == '\0') {
+            fprintf(stderr, "MetaMCP host: HOME and METAMCP_HOST_LAUNCHER are unset\n");
+            return 78;
+        }
+        int written = snprintf(launcher_path, sizeof(launcher_path),
+                               "%s/Library/Application Support/metamcp/run.sh", home);
+        if (written < 0 || (size_t)written >= sizeof(launcher_path)) {
+            fprintf(stderr, "MetaMCP host: launcher path is too long\n");
+            return 78;
+        }
+        launcher = launcher_path;
     }
 
     if (install_handler(SIGTERM) < 0 || install_handler(SIGINT) < 0 ||

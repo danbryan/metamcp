@@ -13,7 +13,7 @@ launchd com.bryanlabs.metamcp
         -> MCP child processes
 ```
 
-The host remains resident, forwards termination signals, and restarts `run.sh` after a two-second delay when the launcher exits. launchd restarts the host if the host itself dies. It has no UI and contains no credentials.
+The host remains resident, forwards termination signals, and restarts `run.sh` after a two-second delay when the launcher exits. The launcher path comes from `METAMCP_HOST_LAUNCHER` or is derived from `HOME`, so the same source works on both laptops. launchd restarts the host if the host itself dies. It has no UI and contains no credentials.
 
 This replaced the prior launchd path that started `/bin/bash` and self-responsible Node directly. INF-474 verified the old path caused repeated macOS App Data prompts. A 14-hour Ghostty-hosted experiment survived sleep/wake and 19 backend restarts with zero Node/Herdr prompts, proving that a stable responsible app is the required boundary.
 

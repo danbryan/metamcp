@@ -12,6 +12,7 @@
   <dict>
     <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>METAMCP_NODE_DIR</key><string>/opt/homebrew/bin</string>
+    <key>METAMCP_HOST_LAUNCHER</key><string>/Users/danb/Library/Application Support/metamcp/run.sh</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

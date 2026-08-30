@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.bryanlabs.metamcp</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/danb/Applications/Bryanlabs MetaMCP Host.app/Contents/MacOS/BryanlabsMetaMCPHost</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/danb/code/github.com/Umbrella-IT-Group/metamcp</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>METAMCP_NODE_DIR</key><string>/opt/homebrew/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>/Users/danb/Library/Logs/metamcp.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/danb/Library/Logs/metamcp.err.log</string>
+</dict>
+</plist>

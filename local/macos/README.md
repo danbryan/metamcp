@@ -31,10 +31,31 @@ Copy the tracked assets to their live paths:
 
 - `run.sh` and `watchdog.sh` -> `~/Library/Application Support/metamcp/`
 - `com.bryanlabs.metamcp.plist` -> `~/Library/LaunchAgents/`
+- `linear-mcp-serve.mjs` -> `~/Library/Application Support/metamcp/linear-mcp/serve.mjs` when using the local Linear transport
 
 Then bootstrap the main, watchdog, and nightly LaunchAgents. The main plist launches the app executable, not shell or Node. The existing `.env`, Postgres database, endpoint keys, and pgdump job are unchanged.
 
 `run.sh` accepts `METAMCP_NODE_DIR` for an isolated runtime test. Production defaults to `/opt/homebrew/bin`. It logs the selected Node executable/version, applies migrations, starts the backend and frontend, and force-reaps either child during shutdown.
+
+### Local Linear MCP
+
+The personal deployment pins `@kkaminsk/linear-mcp@1.0.0` under
+`~/Library/Application Support/metamcp/linear-mcp/` and launches the tracked
+`linear-mcp-serve.mjs` wrapper over stdio. The API key remains in the MetaMCP
+server row's `LINEAR_API_KEY` environment value. The wrapper keeps the package's
+structured MCP result and mirrors it into text because the current MetaMCP proxy
+does not forward `structuredContent` to clients. Install with scripts disabled
+and audit before use:
+
+```sh
+cd ~/Library/Application\ Support/metamcp/linear-mcp
+npm install --ignore-scripts --save-exact @kkaminsk/linear-mcp@1.0.0
+npm audit --omit=dev
+```
+
+Do not invoke the package's `.bin/linear-mcp` symlink. Version 1.0.0's main-module
+check does not recognize that symlink name and exits without starting the MCP
+server; the wrapper imports and runs the packaged entry point directly.
 
 ## Validation
 

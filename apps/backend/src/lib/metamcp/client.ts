@@ -12,6 +12,12 @@ import { getInjectedFetchForServer } from "../m365/injected-fetch";
 import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
 import { metamcpLogStore } from "./log-store";
 import { serverErrorTracker } from "./server-error-tracker";
+import {
+  FANTASTICAL_TIMEOUT_MS,
+  assertFantasticalServerIdentity,
+  installFantasticalRequestGuard,
+  isFantasticalCandidate,
+} from "./server-tool-policy";
 import { resolveEnvVariables } from "./utils";
 
 const sleep = (time: number) =>
@@ -140,6 +146,7 @@ export const transformDockerUrl = (url: string): string => {
 export const createMetaMcpClient = (
   serverParams: ServerParameters,
 ): { client: Client | undefined; transport: Transport | undefined } => {
+  assertFantasticalServerIdentity(serverParams);
   let transport: Transport | undefined;
 
   // Create the appropriate transport based on server type
@@ -267,6 +274,9 @@ export const createMetaMcpClient = (
       capabilities: {},
     },
   );
+  // This is the only construction point for pooled upstream clients. Guard the
+  // request method here so proxy, OpenAPI, retries, and new sessions share it.
+  installFantasticalRequestGuard(client, serverParams);
   return { client, transport };
 };
 
@@ -275,6 +285,11 @@ export const connectMetaMcpClient = async (
   onProcessCrash?: (exitCode: number | null, signal: string | null) => void,
   onTransportDrop?: TransportDropCallback,
 ): Promise<ConnectedClient | undefined> => {
+  // Native consent must not cause a reconnect/prompt loop.
+  const protectedFantastical = isFantasticalCandidate(serverParams);
+  if (protectedFantastical) {
+    serverErrorTracker.setServerMaxAttempts(serverParams.uuid, 1);
+  }
   // Get max attempts from server error tracker instead of hardcoding
   const maxAttempts = await serverErrorTracker.getServerMaxAttempts(
     serverParams.uuid,
@@ -426,7 +441,10 @@ export const connectMetaMcpClient = async (
         };
       }
 
-      await client.connect(transport);
+      await client.connect(
+        transport,
+        protectedFantastical ? { timeout: FANTASTICAL_TIMEOUT_MS } : undefined,
+      );
 
       metamcpLogStore.record({
         category: "connection",
@@ -510,6 +528,14 @@ export const connectMetaMcpClient = async (
         message: `Connect attempt ${count + 1}/${maxAttempts} failed`,
         error,
       });
+      if (protectedFantastical) {
+        // Hold the failed integration for operator review instead of spawning it again.
+        await serverErrorTracker.recordServerCrash(
+          serverParams.uuid,
+          null,
+          null,
+        );
+      }
 
       // CRITICAL FIX: Clean up transport/process on connection failure
       // This prevents orphaned processes from accumulating

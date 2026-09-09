@@ -11,6 +11,11 @@ import {
 } from "../../../db/schema";
 import { parseToolName } from "../tool-name-parser";
 import {
+  FantasticalPolicyError,
+  isAllowedFantasticalQualifiedName,
+  isReservedFantasticalName,
+} from "../server-tool-policy";
+import {
   CallToolMiddleware,
   ListToolsMiddleware,
 } from "./functional-middleware";
@@ -272,6 +277,13 @@ async function applyToolOverrides(
   await Promise.allSettled(
     tools.map(async (tool) => {
       try {
+        // The client policy owns Fantastical's truthful public metadata.
+        // Namespace mappings must not rename or weaken that boundary.
+        if (isReservedFantasticalName(tool.name)) {
+          if (isAllowedFantasticalQualifiedName(tool.name))
+            overriddenTools.push(tool);
+          return;
+        }
         const parsed = parseToolName(tool.name);
         if (!parsed) {
           // If tool name doesn't follow expected format, include as-is
@@ -371,6 +383,17 @@ export async function mapOverrideNameToOriginal(
   namespaceUuid: string,
   useCache: boolean = true,
 ): Promise<string> {
+  // Reject reserved-prefix variants before any reverse lookup. The sole
+  // canonical qualified tool is passed through unchanged.
+  if (isReservedFantasticalName(toolName)) {
+    if (!isAllowedFantasticalQualifiedName(toolName)) {
+      throw new FantasticalPolicyError(
+        "Fantastical policy rejects noncanonical tool name",
+      );
+    }
+    return toolName;
+  }
+
   // Parse the tool name to extract server and tool parts
   const parsed = parseToolName(toolName);
   if (!parsed) {
@@ -385,6 +408,11 @@ export async function mapOverrideNameToOriginal(
       parsed.originalToolName,
     );
     if (originalName) {
+      if (isReservedFantasticalName(originalName)) {
+        throw new FantasticalPolicyError(
+          "Fantastical policy rejects mapped alias",
+        );
+      }
       return originalName;
     }
   }
@@ -425,9 +453,15 @@ export async function mapOverrideNameToOriginal(
         );
       }
 
+      if (isReservedFantasticalName(originalFullName)) {
+        throw new FantasticalPolicyError(
+          "Fantastical policy rejects mapped alias",
+        );
+      }
       return originalFullName;
     }
   } catch (error) {
+    if (error instanceof FantasticalPolicyError) throw error;
     logger.error(
       `Error mapping override name ${toolName} to original in namespace ${namespaceUuid}:`,
       error,

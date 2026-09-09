@@ -22,6 +22,11 @@ import {
 } from "@/middleware/api-key-oauth.middleware";
 import { lookupEndpoint } from "@/middleware/lookup-endpoint-middleware";
 import logger from "@/utils/logger";
+import {
+  filterFantasticalQualifiedTools,
+  isAllowedFantasticalQualifiedName,
+  isReservedFantasticalName,
+} from "@/lib/metamcp/server-tool-policy";
 
 const metaRouter = express.Router();
 
@@ -44,12 +49,15 @@ interface UpstreamSession {
 // row here only costs one re-initialize.
 const metaSessions = new Map<string, UpstreamSession>();
 const META_SESSION_IDLE_MS = 60 * 60 * 1000;
-setInterval(() => {
-  const cutoff = Date.now() - META_SESSION_IDLE_MS;
-  for (const [id, s] of metaSessions) {
-    if (s.lastUsed < cutoff) metaSessions.delete(id);
-  }
-}, 10 * 60 * 1000).unref();
+setInterval(
+  () => {
+    const cutoff = Date.now() - META_SESSION_IDLE_MS;
+    for (const [id, s] of metaSessions) {
+      if (s.lastUsed < cutoff) metaSessions.delete(id);
+    }
+  },
+  10 * 60 * 1000,
+).unref();
 
 function rawCredential(req: express.Request): string | null {
   const apiKeyHeader = req.headers["x-api-key"];
@@ -112,8 +120,9 @@ async function ensureUpstream(session: UpstreamSession): Promise<void> {
     method: "tools/list",
     params: {},
   });
-  session.tools =
-    ((listed?.result as any)?.tools as UpstreamSession["tools"]) ?? [];
+  session.tools = filterFantasticalQualifiedTools(
+    ((listed?.result as any)?.tools as UpstreamSession["tools"]) ?? [],
+  );
 }
 
 const META_TOOLS = [
@@ -129,7 +138,8 @@ const META_TOOLS = [
       properties: {
         query: {
           type: "string",
-          description: "Keywords to match, e.g. 'create invoice' or 'linear issue'",
+          description:
+            "Keywords to match, e.g. 'create invoice' or 'linear issue'",
         },
         limit: { type: "number", description: "Max results (default 25)" },
       },
@@ -186,10 +196,12 @@ async function handleMetaCall(
   await ensureUpstream(session);
 
   if (toolName === "search_tools") {
-    const query = String(args.query ?? "").toLowerCase().trim();
-    const limit = Number(args.limit ?? 25);
+    const query =
+      typeof args.query === "string" ? args.query.toLowerCase().trim() : "";
+    const limit = typeof args.limit === "number" ? args.limit : 25;
+    const catalog = filterFantasticalQualifiedTools(session.tools);
     const words = query.split(/\s+/).filter(Boolean);
-    const scored = session.tools
+    const scored = catalog
       .map((t) => {
         const hay = `${t.name} ${t.description ?? ""}`.toLowerCase();
         const hits = words.filter((w) => hay.includes(w)).length;
@@ -205,14 +217,17 @@ async function handleMetaCall(
     return textResult(
       id,
       lines.length
-        ? `${scored.length} of ${session.tools.length} tools:\n${lines.join("\n")}`
-        : `No matches among ${session.tools.length} tools. Try broader keywords or an empty query to list all.`,
+        ? `${scored.length} of ${catalog.length} tools:\n${lines.join("\n")}`
+        : `No matches among ${catalog.length} tools. Try broader keywords or an empty query to list all.`,
     );
   }
 
   if (toolName === "describe_tools") {
-    const names = (args.names as string[]) ?? [];
-    const found = session.tools.filter((t) => names.includes(t.name));
+    const names = Array.isArray(args.names)
+      ? args.names.filter((name): name is string => typeof name === "string")
+      : [];
+    const catalog = filterFantasticalQualifiedTools(session.tools);
+    const found = catalog.filter((t) => names.includes(t.name));
     const missing = names.filter((n) => !found.some((t) => t.name === n));
     const out: Record<string, unknown> = {};
     for (const t of found) {
@@ -223,7 +238,18 @@ async function handleMetaCall(
   }
 
   if (toolName === "call_tool") {
-    const name = String(args.name ?? "");
+    const name = args.name;
+    if (
+      typeof name !== "string" ||
+      (isReservedFantasticalName(name) &&
+        !isAllowedFantasticalQualifiedName(name))
+    ) {
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32602, message: "Invalid protected tool name" },
+      };
+    }
     const forwarded = await upstreamRpc(session, {
       jsonrpc: "2.0",
       id,
@@ -278,7 +304,10 @@ metaRouter.post(
           result: {
             protocolVersion: msg.params?.protocolVersion ?? "2025-03-26",
             capabilities: { tools: {} },
-            serverInfo: { name: `metamcp-meta-${endpointName}`, version: "1.0.0" },
+            serverInfo: {
+              name: `metamcp-meta-${endpointName}`,
+              version: "1.0.0",
+            },
           },
         });
       }

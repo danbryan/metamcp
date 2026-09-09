@@ -68,6 +68,60 @@ Required after deployment:
 5. Killing the backend leaves the host PID unchanged and produces a healthy replacement backend.
 6. Sleep/wake and reboot do not raise Node privacy prompts.
 
+## Fantastical suggestions-only integration
+
+The bundled Flexibits native helper is launched directly, not through the retired
+Node MCP wrapper. The gateway policy in
+`apps/backend/src/lib/metamcp/server-tool-policy.ts` reserves:
+
+- Server UUID: `646228d4-3167-4be1-b3ee-615f8d5c43c2`
+- Name: `fantastical-suggestions`
+- Type: `STDIO`
+- Command: `/Applications/Fantastical.app/Contents/Helpers/FantasticalMCP.app/Contents/MacOS/FantasticalMCP`
+- Sole allowed tool: `findAvailableTimes`
+
+Any identity mismatch is denied. The guard is installed at the pooled SDK
+client's request boundary, covering regular MCP, OpenAPI, discovery, and
+reconnected clients. Unknown tools and alternate request methods are rejected
+before dispatch; only the allowed tool is cached. Namespace name overrides
+cannot turn another name into this tool. Meta search/describe also filter stale
+reserved-name entries. Other providers retain their existing behavior.
+
+Do not substitute namespace `INACTIVE` mappings for this policy: those mappings
+permit unknown future tools and database lookup failures by default. The native
+server remains write-capable internally; the gateway is the enforced boundary,
+not an intrinsic read-only permission granted by Fantastical.
+
+The integration uses one connection attempt and a 15-second initialization/tool
+call deadline. A failed connection is held in server error state for operator
+review. Native call failures return an MCP tool-error result, not a transport
+exception, so the gateway cannot automatically reconnect and repeat the call.
+Stop on a native consent prompt, never auto-click or respawn to obtain permission.
+Deploy through the existing signed MetaMCP Host without changing macOS grants.
+
+Suggestions default to the CURRENT Fantastical calendar set. Confirm that it
+contains the intended calendars, and recheck availability through the owning
+Google/Microsoft connector before booking. A suggestion is not a reservation.
+
+Activation requires the focused policy/override tests, backend suite/typecheck,
+full `pnpm build`, then a controlled signed-host restart. Register only on the
+intended namespaces. Verify one advertised tool, denied calls to forbidden names
+through both MCP and OpenAPI, unchanged unrelated tool mappings, and one real
+read-only suggestion request. Never test by creating a disposable event.
+
+The September 9, 2026 live checks passed discovery and denial enforcement but
+native suggestion calls exceeded the 15-second deadline. The new registration
+was removed after setting both mappings INACTIVE, because global idle warming
+can still launch a server with no active namespace. Inactive registration SQL
+is preserved in `~/code/local/Backup/fantastical-suggestions-20260909-185959/`.
+No booking was made and no native consent dialog was observed. Do not activate
+based on discovery alone. Resolve the native response failure and confirm
+calendar scope first.
+
+Rollback the new server registration/mappings before reverting the guard, so
+there is never an unrestricted native server. Preserve unrelated database work;
+do not restore the full preflight dump over newer records.
+
 ## Node runtime
 
 Node's official production recommendation is Active or Maintenance LTS. During INF-474, system Node 26.7.0 (Current) repeatedly crashed in built-in Undici HTTP/2 while the hosted Linear transport dropped. Official Node 26.8.1, which updates bundled Undici to 8.10.0, completed the accepted read-load sample without errors and became the current system runtime. Node 24 LTS remains installed keg-only for future comparison, not as an automatic fallback.

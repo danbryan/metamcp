@@ -22,6 +22,10 @@ import {
 import { z } from "zod";
 
 import logger from "@/utils/logger";
+import {
+  FANTASTICAL_SERVER_NAME,
+  FANTASTICAL_SERVER_UUID,
+} from "./server-tool-policy";
 
 import { namespacesRepository } from "../../db/repositories/namespaces.repo";
 import { toolsImplementations } from "../../trpc/tools.impl";
@@ -507,6 +511,12 @@ export const createServer = async (
 
         // Find the server with the matching name prefix
         for (const [mcpServerUuid, params] of Object.entries(serverParams)) {
+          // Do not wait for unrelated providers on a cold suggestions call.
+          if (
+            serverPrefix === FANTASTICAL_SERVER_NAME &&
+            mcpServerUuid !== FANTASTICAL_SERVER_UUID
+          )
+            continue;
           const session = await mcpServerPool.getSession(
             sessionId,
             mcpServerUuid,

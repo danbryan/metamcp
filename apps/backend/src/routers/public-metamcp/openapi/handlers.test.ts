@@ -125,6 +125,35 @@ describe("OpenAPI bridge — tools/call recovery cascade", () => {
     getSessionMock.mockReset();
   });
 
+  it("routes a cold Fantastical request without touching unrelated providers", async () => {
+    const uuid = "646228d4-3167-4be1-b3ee-615f8d5c43c2";
+    fakeServerParams[uuid] = { name: "fantastical-suggestions" };
+    const success = { content: [{ type: "text", text: "suggestions" }] };
+    const target = makeFakeSession(vi.fn().mockResolvedValue(success));
+    getSessionMock.mockImplementation(async (_session, serverUuid) => {
+      if (serverUuid !== uuid)
+        throw new Error("Unrelated provider must not be contacted");
+      return target;
+    });
+    try {
+      const result = await createOriginalCallToolHandler()(
+        {
+          method: "tools/call",
+          params: {
+            name: "fantastical-suggestions__findAvailableTimes",
+            arguments: { durationMinutes: 30 },
+          },
+        },
+        { namespaceUuid: "ns-1", sessionId: "cold-fantastical" },
+      );
+      expect(result).toEqual(success);
+      expect(getSessionMock).toHaveBeenCalledOnce();
+      expect(target.client.request).toHaveBeenCalledOnce();
+    } finally {
+      delete fakeServerParams[uuid];
+    }
+  });
+
   it("invalidates + retries once on session-lost envelope, returns success", async () => {
     const successResult: CallToolResult = {
       content: [{ type: "text", text: "ok" }],

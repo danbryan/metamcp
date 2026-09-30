@@ -53,7 +53,10 @@ import {
   createToolOverridesListToolsMiddleware,
   mapOverrideNameToOriginal,
 } from "./metamcp-middleware/tool-overrides.functional";
-import { isRecoverableBackendError } from "./session-error";
+import {
+  isRecoverableBackendError,
+  isToolCallReplaySafeError,
+} from "./session-error";
 import { acquireSessionWithBoundedWarmup } from "./tool-call-warmup";
 import { parseToolName } from "./tool-name-parser";
 import { toolsSyncCache } from "./tools-sync-cache";
@@ -739,7 +742,16 @@ export const createServer = async (
     try {
       return (await callOnce(clientForTool)) as CallToolResult;
     } catch (error) {
-      if (!isRecoverableBackendError(error)) {
+      // Replay a tools/call ONLY when the failure proves the backend never
+      // ran it: an HTTP 404 "Session not found" answer to the POST, or a
+      // transport already closed before the send. A tool call is not
+      // idempotent (a delete, a reboot, a password reset), so a timeout, a
+      // connection dropped mid-call or a 5xx surfaces to the client instead:
+      // the backend may have executed it, and a second send runs it twice.
+      // The 2026-09-30 client-side duplicate prompted finding this separate
+      // gateway retry: a 60 s timeout's -32001 read as session-lost. Do not
+      // swap this back to isRecoverableBackendError; see isToolCallReplaySafeError.
+      if (!isToolCallReplaySafeError(error)) {
         logger.error(
           `Error calling tool "${name}" through ${
             clientForTool.client.getServerVersion()?.name || "unknown"
@@ -750,7 +762,7 @@ export const createServer = async (
       }
 
       logger.warn(
-        `Backend connection lost for server ${serverUuid} on tool "${name}"; invalidating pool and retrying once. (envelope: ${
+        `Backend connection lost for server ${serverUuid} on tool "${name}" before the call was executed; invalidating pool and retrying once. (envelope: ${
           error instanceof Error ? error.message : String(error)
         })`,
       );

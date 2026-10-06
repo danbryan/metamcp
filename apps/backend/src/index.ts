@@ -1,3 +1,5 @@
+import "./lib/http-dispatcher";
+
 import express from "express";
 
 import { auth } from "./auth";

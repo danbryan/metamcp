@@ -126,6 +126,12 @@ do not restore the full preflight dump over newer records.
 
 Node's official production recommendation is Active or Maintenance LTS. During INF-474, system Node 26.7.0 (Current) repeatedly crashed in built-in Undici HTTP/2 while the hosted Linear transport dropped. Official Node 26.8.1, which updates bundled Undici to 8.10.0, completed the accepted read-load sample without errors and became the current system runtime. Node 24 LTS remains installed keg-only for future comparison, not as an automatic fallback.
 
+The crash came back on Node 26.8.2 (INF-589, about 280 restarts): the bundled Undici negotiates HTTP/2 with TLS servers such as `mcp.exa.ai`, and its HTTP/2 idle timeout emits an `error` (`UND_ERR_INFO`) on a stream with no listener, which exits the backend. Since 2026-10-05 the backend sets a global Undici dispatcher with `allowH2: false` before anything fetches (`apps/backend/src/lib/http-dispatcher.ts`, `undici` pinned to the version Node bundles), so outbound fetch stays on HTTP/1.1 whatever Node ships. When Node's bundled Undici moves a major version, move the pin with it.
+
+## Logs
+
+`run.sh` rotates `~/Library/Logs/metamcp.{out,err}.log` and the backend's `app.log` and `error.log` at startup once they pass 256 MB, keeping three gzip generations. Every writer appends, so copy-then-truncate loses nothing, and the 04:00 nightly restart makes it a daily check. `LOG_LEVEL=info` in `.env` is what makes them large.
+
 ## Rollback
 
 The pre-host LaunchAgent, scripts, database dump, and responsibility evidence are under:

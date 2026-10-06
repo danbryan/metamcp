@@ -31,6 +31,26 @@ while IFS= read -r line || [ -n "$line" ]; do
   export "$key=$val"
 done < "$ENV_FILE"
 
+# --- Rotate logs -------------------------------------------------------------
+# launchd and the backend logger both open these in append mode, so a
+# copy-then-truncate before the children start loses nothing. The nightly
+# restart makes this the daily rotation. Keeps three compressed generations.
+ROTATE_BYTES=$((256 * 1024 * 1024))
+rotate_log() {
+  local f="$1" size
+  [ -f "$f" ] || return 0
+  size=$(/usr/bin/stat -f %z "$f")
+  [ "$size" -ge "$ROTATE_BYTES" ] || return 0
+  [ -f "$f.2.gz" ] && mv -f "$f.2.gz" "$f.3.gz"
+  [ -f "$f.1.gz" ] && mv -f "$f.1.gz" "$f.2.gz"
+  gzip -1 -c "$f" > "$f.1.gz" && : > "$f"
+  echo "rotated $f ($size bytes)"
+}
+for log in "$HOME/Library/Logs/metamcp.out.log" "$HOME/Library/Logs/metamcp.err.log" \
+           "$REPO/apps/backend/app.log" "$REPO/apps/backend/error.log"; do
+  rotate_log "$log"
+done
+
 # --- Wait for Postgres -------------------------------------------------------
 tries=0
 until pg_isready -h "${POSTGRES_HOST:-localhost}" -p "${POSTGRES_PORT:-5432}" \

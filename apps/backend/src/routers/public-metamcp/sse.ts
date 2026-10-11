@@ -11,7 +11,81 @@ import { rateLimitMiddleware } from "@/middleware/rate-limit.middleware";
 import logger from "@/utils/logger";
 
 import { metaMcpServerPool } from "../../lib/metamcp/metamcp-server-pool";
-import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
+import { resolveSessionIdentity } from "../../lib/metamcp/session-auth";
+import { emitSessionBindingDenial } from "../../lib/metamcp/session-binding-denial";
+import {
+  boundSessionMatches,
+  classifyBindingDenial,
+  SessionBinding,
+  SessionBindingDenialReason,
+  SessionLifetimeManager,
+  SessionLifetimeManagerImpl,
+} from "../../lib/session-lifetime-manager";
+
+/**
+ * The full binding a request presents — endpoint plus the identity
+ * `authenticateApiKey` resolved for it. Ported from upstream #134.
+ */
+function requestBinding(authReq: ApiKeyAuthenticatedRequest): SessionBinding {
+  return {
+    namespaceUuid: authReq.namespaceUuid,
+    endpointName: authReq.endpointName,
+    identity: resolveSessionIdentity(authReq),
+  };
+}
+
+/**
+ * Pure resolver for the `/message` leg's ownership guard. The message must
+ * target the SAME endpoint the SSE stream was opened on AND come from the
+ * credential that opened it: resolving by sessionId alone would let a caller
+ * authenticated for endpoint A post messages into endpoint B's transport, or
+ * one consumer post into another consumer's stream on a multi-key endpoint.
+ *
+ * A missing session and a refused one both resolve to `not_found` so the
+ * route's 404 never signals the id is live elsewhere.
+ */
+export function resolveSseMessageSession(
+  manager: Pick<
+    SessionLifetimeManager<Transport>,
+    "getSession" | "getSessionBinding"
+  >,
+  sessionId: string,
+  target: SessionBinding,
+):
+  | { outcome: "ok"; transport: Transport }
+  | { outcome: "not_found"; refusedReason: SessionBindingDenialReason | null } {
+  const transport = manager.getSession(sessionId);
+  if (!transport) {
+    return { outcome: "not_found", refusedReason: null };
+  }
+  const binding = manager.getSessionBinding(sessionId);
+  if (!boundSessionMatches(binding, target)) {
+    return {
+      outcome: "not_found",
+      refusedReason: classifyBindingDenial(binding, target),
+    };
+  }
+  return { outcome: "ok", transport };
+}
+
+/** Record a refused SSE message leg through the throttled denial sink. */
+export function refuseSseMessage(
+  authReq: ApiKeyAuthenticatedRequest,
+  sessionId: string,
+  reason: SessionBindingDenialReason,
+): void {
+  const { emitted, suppressed } = emitSessionBindingDenial(authReq, {
+    sessionId,
+    reason,
+  });
+  if (emitted) {
+    logger.warn(
+      `SSE message for session ${sessionId} on endpoint ${authReq.endpointName} ` +
+        `refused (${reason}). ` +
+        `${suppressed} similar refusal(s) suppressed since the last line.`,
+    );
+  }
+}
 
 const sseRouter = express.Router();
 
@@ -85,7 +159,11 @@ sseRouter.get(
         `Using MetaMCP server instance for public endpoint session ${sessionId}`,
       );
 
-      sessionManager.addSession(sessionId, webAppTransport);
+      sessionManager.addSession(
+        sessionId,
+        webAppTransport,
+        requestBinding(req as ApiKeyAuthenticatedRequest),
+      );
 
       // Handle cleanup when connection closes
       res.on("close", async () => {
@@ -114,17 +192,25 @@ sseRouter.post(
 
     try {
       const sessionId = req.query.sessionId;
-      // logger.info(
-      //   `Received POST message for public endpoint ${endpointName} -> namespace ${namespaceUuid} sessionId ${sessionId}`,
-      // );
 
-      const transport = sessionManager.getSession(
+      // Ownership guard — see resolveSseMessageSession's doc comment.
+      const resolution = resolveSseMessageSession(
+        sessionManager,
         sessionId as string,
-      ) as SSEServerTransport;
-      if (!transport) {
+        requestBinding(req as ApiKeyAuthenticatedRequest),
+      );
+      if (resolution.outcome === "not_found") {
+        if (resolution.refusedReason) {
+          refuseSseMessage(
+            req as ApiKeyAuthenticatedRequest,
+            sessionId as string,
+            resolution.refusedReason,
+          );
+        }
         res.status(404).end("Session not found");
         return;
       }
+      const transport = resolution.transport as SSEServerTransport;
       await transport.handlePostMessage(req, res);
     } catch (error) {
       logger.error("Error in public endpoint /message route:", error);

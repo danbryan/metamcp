@@ -4,6 +4,7 @@ import express from "express";
 import logger from "@/utils/logger";
 
 import { ApiKeysRepository } from "../db/repositories/api-keys.repo";
+import { oauthRepository } from "../db/repositories/oauth.repo";
 import {
   authRateLimiter,
   getAuthRateLimitIdentifier,
@@ -63,47 +64,26 @@ async function validateOAuthToken(
   try {
     // Check if this is our MCP OAuth token format
     if (token.startsWith("mcp_token_")) {
-      // For MCP tokens, use introspection endpoint to validate
-      // This allows us to check against the stored token data
-      try {
-        const baseUrl = getBaseUrl(req);
-        const introspectUrl = new URL("/oauth/introspect", baseUrl);
+      // Validate against the stored token directly rather than our own
+      // /oauth/introspect endpoint: the introspection call was a self-call
+      // over HTTP (extra hop, own credentials in play), which the upstream
+      // security wave removed (#143-era hardening). Fork adaptation keeps the
+      // same signature so existing call sites keep passing `req`.
+      const tokenData = await oauthRepository.getAccessToken(token);
 
-        const introspectRequest = new Request(introspectUrl.toString(), {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ token }),
-        });
-
-        const introspectResponse = await fetch(introspectRequest);
-
-        if (!introspectResponse.ok) {
-          return { valid: false, error: "Token introspection failed" };
-        }
-
-        const introspectData = (await introspectResponse.json()) as {
-          active?: boolean;
-          sub?: string;
-          scope?: string;
-        };
-
-        if (!introspectData.active) {
-          return { valid: false, error: "Token is not active" };
-        }
-
-        return {
-          valid: true,
-          user_id: introspectData.sub,
-          scopes: introspectData.scope
-            ? introspectData.scope.split(" ")
-            : ["admin"],
-        };
-      } catch (error) {
-        logger.error("Error introspecting MCP token:", error);
-        return { valid: false, error: "Token validation failed" };
+      if (!tokenData) {
+        return { valid: false, error: "Token is not active" };
       }
+
+      if (Date.now() > tokenData.expires_at.getTime()) {
+        return { valid: false, error: "Token is not active" };
+      }
+
+      return {
+        valid: true,
+        user_id: tokenData.user_id,
+        scopes: tokenData.scope ? tokenData.scope.split(" ") : ["admin"],
+      };
     }
 
     // Token is not a recognized MCP token format

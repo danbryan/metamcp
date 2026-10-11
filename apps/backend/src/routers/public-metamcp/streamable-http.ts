@@ -25,12 +25,24 @@ import {
   AuthMethod,
   hashAuthPrincipal,
   principalMatches,
+  resolveSessionIdentity,
 } from "../../lib/metamcp/session-auth";
+import {
+  emitSessionBindingDenial,
+  extractPresentedCredential,
+  type SessionDenialReason,
+} from "../../lib/metamcp/session-binding-denial";
 import {
   assertRecoveryHydrationContract,
   hydrateRecoveredTransport,
 } from "../../lib/metamcp/transport-recovery-hydration";
-import { SessionLifetimeManagerImpl } from "../../lib/session-lifetime-manager";
+import {
+  bindingMatches,
+  boundSessionMatches,
+  classifyBindingDenial,
+  SessionBinding,
+  SessionLifetimeManagerImpl,
+} from "../../lib/session-lifetime-manager";
 
 const streamableHttpRouter = express.Router();
 
@@ -74,6 +86,149 @@ function handleRequestWithUserContext(
  */
 function authMethodFromRequest(req: ApiKeyAuthenticatedRequest): AuthMethod {
   return req.authMethod === "oauth" ? "oauth" : "api_key";
+}
+
+// ============================================================================
+// Session-credential binding guards (ported from upstream #134)
+//
+// The in-memory session map is keyed by `Mcp-Session-Id` ALONE, so a bare
+// `getSession(sessionId)` will hand one caller's transport to another:
+// endpoint A's transport to a credential authenticated only for endpoint B,
+// or consumer A's live session to consumer B on an endpoint reachable by
+// multiple credentials. The DB-backed recovery path re-checked WHO owned the
+// session; the in-memory fast path, which serves every request after the
+// first, checked nothing. These guards close that gap without the upstream
+// audit-log wave (#105), which this fork does not import.
+// ============================================================================
+
+/**
+ * The full binding a request presents: the endpoint it is targeting plus the
+ * identity of the credential `authenticateApiKey` resolved for it.
+ */
+function requestBinding(authReq: ApiKeyAuthenticatedRequest): SessionBinding {
+  return {
+    namespaceUuid: authReq.namespaceUuid,
+    endpointName: authReq.endpointName,
+    identity: resolveSessionIdentity(authReq),
+  };
+}
+
+export type BoundSessionResolution =
+  | { outcome: "ok"; transport: StreamableHTTPServerTransport }
+  | { outcome: "absent" }
+  | { outcome: "refused" };
+
+/**
+ * Record a refused session reuse through the throttled denial sink.
+ * The refusal itself is always answered 404 (same statement as a genuine
+ * miss), so the response never confirms that the id is live and owned by
+ * someone else.
+ */
+function refuseBoundSession(
+  sessionId: string,
+  authReq: ApiKeyAuthenticatedRequest,
+  reason: SessionDenialReason,
+): void {
+  emitSessionBindingDenial(authReq, {
+    sessionId,
+    reason,
+  });
+}
+
+/**
+ * Resolve a session's transport ONLY for the endpoint the session belongs
+ * to AND the credential that created it. `refused` skips recovery: recovery
+ * would answer 401 and confirm the id belongs to someone else; the route
+ * funnels that outcome into the same 404 as a genuine miss.
+ */
+export function resolveBoundSession(
+  sessionId: string,
+  authReq: ApiKeyAuthenticatedRequest,
+): BoundSessionResolution {
+  const transport = sessionManager.getSession(sessionId);
+  if (!transport) {
+    return { outcome: "absent" };
+  }
+  const binding = sessionManager.getSessionBinding(sessionId);
+  const target = requestBinding(authReq);
+  if (!boundSessionMatches(binding, target)) {
+    refuseBoundSession(
+      sessionId,
+      authReq,
+      classifyBindingDenial(binding, target),
+    );
+    return { outcome: "refused" };
+  }
+  return { outcome: "ok", transport };
+}
+
+/**
+ * Ownership guard for the DELETE leg: only the endpoint AND the credential
+ * that own a session may tear it down. In memory the binding is endpoint +
+ * creating identity. If the session was already reaped (idle reaper), the
+ * persisted row is the only evidence, so the check falls back to the same
+ * `auth_method` + `auth_principal` comparison recovery makes. Every
+ * non-deletable case collapses into one `not_found` outcome, so the single
+ * 404 response cannot reveal the id is live elsewhere.
+ */
+export async function resolveDeletableSession(
+  sessionId: string,
+  authReq: ApiKeyAuthenticatedRequest,
+): Promise<{ outcome: "deletable" } | { outcome: "not_found" }> {
+  const target = requestBinding(authReq);
+  const inMemoryTransport = sessionManager.getSession(sessionId);
+  if (inMemoryTransport) {
+    const binding = sessionManager.getSessionBinding(sessionId);
+    if (!boundSessionMatches(binding, target)) {
+      refuseBoundSession(
+        sessionId,
+        authReq,
+        classifyBindingDenial(binding, target),
+      );
+      return { outcome: "not_found" };
+    }
+    return { outcome: "deletable" };
+  }
+
+  let stored;
+  try {
+    stored = await mcpSessionsRepository.findById(sessionId);
+  } catch (lookupError) {
+    logger.warn(
+      `mcp_sessions lookup failed during DELETE for session ${sessionId}; treating as not found.`,
+      lookupError,
+    );
+    stored = null;
+  }
+  if (
+    !stored ||
+    !bindingMatches(
+      {
+        namespaceUuid: stored.namespace_uuid,
+        endpointName: stored.endpoint_name,
+      },
+      target,
+    )
+  ) {
+    return { outcome: "not_found" };
+  }
+  const rawToken = extractPresentedCredential(authReq, authReq.endpoint);
+  if (
+    !rawToken ||
+    stored.auth_method !== authMethodFromRequest(authReq) ||
+    !principalMatches(
+      hashAuthPrincipal(rawToken, authMethodFromRequest(authReq)),
+      stored.auth_principal,
+    )
+  ) {
+    refuseBoundSession(
+      sessionId,
+      authReq,
+      "session_persisted_credential_mismatch",
+    );
+    return { outcome: "not_found" };
+  }
+  return { outcome: "deletable" };
 }
 
 /**
@@ -272,7 +427,7 @@ async function recoverPersistedSession(
       );
     return { status: "not_found" };
   }
-  sessionManager.addSession(sessionId, transport);
+  sessionManager.addSession(sessionId, transport, requestBinding(authReq));
   // Best-effort touch; failure is non-fatal — pruner only deletes
   // genuinely stale rows.
   mcpSessionsRepository
@@ -571,24 +726,29 @@ streamableHttpRouter.get(
       logger.info(`Looking up existing session: ${sessionId}`);
 
       const authReq = req as ApiKeyAuthenticatedRequest;
-      let transport = sessionManager.getSession(sessionId);
-      if (!transport) {
-        logger.info(
-          `Session ${sessionId} not found in session manager — attempting lazy recovery from mcp_sessions.`,
-        );
-        const recovery = await recoverPersistedSession(sessionId, authReq);
-        if (recovery.status === "recovered") {
-          transport = recovery.transport;
-        } else if (recovery.status === "auth_failed") {
-          res.status(401).end("Unauthorized");
-          return;
-        } else {
-          // Stale or expired sessionId. Per MCP Streamable HTTP spec the
-          // client MUST start a new session in response to HTTP 404 on a
-          // sessioned request. Surface a header-flag for clients that
-          // honor the contract, and keep the response body minimal
-          // (the previous body dumped the full active-session list into
-          // logs/clients — info leak + not actionable).
+      let transport: StreamableHTTPServerTransport | undefined;
+      const resolved = resolveBoundSession(sessionId, authReq);
+      if (resolved.outcome === "ok") {
+        transport = resolved.transport;
+      } else {
+        if (resolved.outcome === "absent") {
+          logger.info(
+            `Session ${sessionId} not found in session manager — attempting lazy recovery from mcp_sessions.`,
+          );
+          const recovery = await recoverPersistedSession(sessionId, authReq);
+          if (recovery.status === "recovered") {
+            transport = recovery.transport;
+          } else if (recovery.status === "auth_failed") {
+            res.status(401).end("Unauthorized");
+            return;
+          }
+        }
+        if (!transport) {
+          // Stale, expired, or not this caller's sessionId. Per MCP
+          // Streamable HTTP spec the client MUST start a new session in
+          // response to HTTP 404 on a sessioned request. ONE response
+          // statement for every non-servable case, so a refused reuse is
+          // indistinguishable from a miss.
           res
             .status(404)
             .setHeader("Mcp-Session-Reinitialize-Required", "true")
@@ -692,8 +852,9 @@ streamableHttpRouter.post(
           `Session ${newSessionId} will be cleaned up when DELETE request is received`,
         );
 
-        // Store transport reference
-        sessionManager.addSession(newSessionId, transport);
+        // Store transport reference, bound to this endpoint AND the credential
+        // that created it, so later in-memory lookups re-verify ownership.
+        sessionManager.addSession(newSessionId, transport, requestBinding(authReq));
 
         logger.info(
           `Public Endpoint Client <-> Proxy sessionId: ${newSessionId} for endpoint ${endpointName} -> namespace ${namespaceUuid}`,
@@ -763,51 +924,40 @@ streamableHttpRouter.post(
         logger.info(`Looking up existing session: ${sessionId}`);
         logger.info(`Available sessions:`, sessionManager.getSessionIds());
 
-        let transport = sessionManager.getSession(sessionId);
-        if (!transport) {
-          logger.info(
-            `Transport for sessionId ${sessionId} not in memory — attempting lazy recovery from mcp_sessions.`,
-          );
-          const recovery = await recoverPersistedSession(sessionId, authReq);
-          if (recovery.status === "recovered") {
-            transport = recovery.transport;
-            // Bump idempotently so subsequent same-session reads hit the
-            // in-memory map; touch already happened inside recovery.
-          } else if (recovery.status === "auth_failed") {
-            logger.warn(
-              `Lazy recovery refused for session ${sessionId}: auth principal mismatch or missing credential.`,
+        let transport: StreamableHTTPServerTransport | undefined;
+        const resolved = resolveBoundSession(sessionId, authReq);
+        if (resolved.outcome === "ok") {
+          transport = resolved.transport;
+        } else {
+          if (resolved.outcome === "absent") {
+            logger.info(
+              `Transport for sessionId ${sessionId} not in memory — attempting lazy recovery from mcp_sessions.`,
             );
-            res.status(401).json({
-              error: "Unauthorized",
-              message:
-                "Stored auth principal does not match incoming credential.",
-              timestamp: new Date().toISOString(),
-            });
-            return;
-          } else {
+            const recovery = await recoverPersistedSession(sessionId, authReq);
+            if (recovery.status === "recovered") {
+              transport = recovery.transport;
+              // Bump idempotently so subsequent same-session reads hit the
+              // in-memory map; touch already happened inside recovery.
+            } else if (recovery.status === "auth_failed") {
+              logger.warn(
+                `Lazy recovery refused for session ${sessionId}: auth principal mismatch or missing credential.`,
+              );
+              res.status(401).json({
+                error: "Unauthorized",
+                message:
+                  "Stored auth principal does not match incoming credential.",
+                timestamp: new Date().toISOString(),
+              });
+              return;
+            }
+          }
+          if (!transport) {
             logger.error(
               `Transport not found for sessionId ${sessionId} and no recoverable persisted row.`,
             );
-            // Stale or expired sessionId. The prior response embedded
-            // `available_sessions: sessionManager.getSessionIds()` —
-            // a mild info leak of every live session UUID into client
-            // logs + zero diagnostic value to the caller (the caller
-            // just learns their own ID isn't in the list, which the
-            // 404 already conveyed).
-            //
-            // Per MCP Streamable HTTP spec the client MUST start a new
-            // session in response to HTTP 404 on a sessioned request.
-            // The `Mcp-Session-Reinitialize-Required` header signals
-            // that explicitly for spec-conformant clients; the body
-            // message guides anyone reading it manually.
-            //
-            // Background: 2026-05-15 sub-agent validation run on the
-            // CIPP MCP namespace hit this path 100% — Claude Code's
-            // MCP connector held a sessionId rotated out by the server,
-            // and the harness didn't auto-reinitialize on 404. Until
-            // the client side honors reinit, this is the cleanest
-            // server-side signal we can hand it. Task #29 has the
-            // full background.
+            // Stale, expired, or not this caller's sessionId. The prior
+            // response embedded `available_sessions` (a mild info leak of
+            // every live session UUID); the 404 already conveys it.
             res
               .status(404)
               .setHeader("Mcp-Session-Reinitialize-Required", "true")
@@ -863,6 +1013,23 @@ streamableHttpRouter.delete(
           `Available sessions before cleanup:`,
           sessionManager.getSessionIds(),
         );
+
+        // Only the owning endpoint + credential may tear a session down.
+        const deletable = await resolveDeletableSession(sessionId, authReq);
+        if (deletable.outcome === "not_found") {
+          res
+            .status(404)
+            .setHeader("Mcp-Session-Reinitialize-Required", "true")
+            .json({
+              error: "Session not found",
+              message:
+                "Session expired or unknown. Initialize a new MCP " +
+                "session (send `initialize` without an " +
+                "`Mcp-Session-Id` header).",
+              timestamp: new Date().toISOString(),
+            });
+          return;
+        }
 
         await cleanupSession(sessionId);
 

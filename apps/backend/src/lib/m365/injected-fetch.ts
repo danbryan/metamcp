@@ -76,8 +76,12 @@ const injectedFetchSingleton: FetchLike = makeM365InjectedFetch();
  */
 export function getInjectedFetchForServer(
   serverName: string,
+  baseFetch?: FetchLike,
 ): FetchLike | undefined {
-  return getInjectedServerNames().has(serverName)
-    ? injectedFetchSingleton
-    : undefined;
+  if (!getInjectedServerNames().has(serverName)) {
+    return undefined;
+  }
+  return baseFetch
+    ? makeM365InjectedFetch(m365MintService, baseFetch)
+    : injectedFetchSingleton;
 }

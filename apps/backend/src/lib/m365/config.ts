@@ -94,6 +94,26 @@ export function getInjectedServerNames(): Set<string> {
 }
 
 /**
+ * The token KEK alone, for paths that need it without the rest of the broker
+ * config (the server-bearer at-rest encryption from upstream #153).
+ * Returns null when `M365_TOKEN_KEK` is unset; throws only when the key is
+ * present but malformed, matching getM365BrokerConfig's validation.
+ */
+export function getTokenKek(): { kek: Buffer; kekId: string } | null {
+  const kekB64 = process.env.M365_TOKEN_KEK || undefined;
+  if (!kekB64) {
+    return null;
+  }
+  const kek = Buffer.from(kekB64, "base64");
+  if (kek.length !== 32) {
+    throw new Error(
+      `M365_TOKEN_KEK must be base64 for exactly 32 bytes (AES-256); got ${kek.length} bytes`,
+    );
+  }
+  return { kek, kekId: process.env.M365_KEK_ID || "k1" };
+}
+
+/**
  * Full config. Throws (with a plain Error — callers translate to the
  * typed `not_configured` broker error where user-facing) when required
  * env is missing or the KEK is malformed.

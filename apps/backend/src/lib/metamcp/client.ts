@@ -2,22 +2,28 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StdioServerParameters } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import {
+  FetchLike,
+  Transport,
+} from "@modelcontextprotocol/sdk/shared/transport.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { ServerParameters } from "@repo/zod-types";
 
 import logger from "@/utils/logger";
 
-import { getInjectedFetchForServer } from "../m365/injected-fetch";
-import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
-import { metamcpLogStore } from "./log-store";
-import { serverErrorTracker } from "./server-error-tracker";
 import {
-  FANTASTICAL_TIMEOUT_MS,
-  assertFantasticalServerIdentity,
-  installFantasticalRequestGuard,
-  isFantasticalCandidate,
-} from "./server-tool-policy";
+  isM365BrokerError,
+  M365BrokerError,
+  M365BrokerErrorCode,
+} from "../m365/errors";
+import { getInjectedFetchForServer } from "../m365/injected-fetch";
+import { recordConnectBrokerFailure } from "../m365/request-context";
+import { ProcessManagedStdioTransport } from "../stdio-transport/process-managed-transport";
+import { describeConnectError, formatConnectionAge } from "./connect-error";
+import { metamcpLogStore } from "./log-store";
+import { resolveServerBearerToken } from "./server-bearer-crypto";
+import { serverErrorTracker } from "./server-error-tracker";
+import { createGuardedFetch } from "./url-guard";
 import { resolveEnvVariables } from "./utils";
 
 const sleep = (time: number) =>
@@ -94,6 +100,184 @@ export const computeReconnectBackoffMs = (attempt: number): number => {
 };
 
 /**
+ * Upper bound on how long teardown waits for the spec session-termination
+ * DELETE before it gives up and closes the transport anyway.
+ *
+ * Teardown runs on latency-sensitive paths (idle sweep, pool-cap
+ * eviction, the `invalidateServerConnection` cascade), so an unbounded
+ * DELETE against a backend that is hung, mid-restart or gone would stall
+ * pool eviction behind one dead server — the exact failure this fix must
+ * not introduce. 2s is generous for the container-to-container round trip
+ * every one of our backends actually makes, and short enough that a dead
+ * backend costs one blink instead of a wedged pool.
+ */
+const SESSION_TERMINATE_TIMEOUT_MS = 2000;
+
+/**
+ * Upper bound on `transport.start()`, the one connect step with no timeout
+ * of its own.
+ *
+ * WHY THIS EXISTS: `client.connect(transport)` awaits start and only then
+ * sends `initialize`, which the SDK bounds with its 60 s request timeout.
+ * An SSE backend that answers the stream GET and then sends heartbeats
+ * without ever sending its `endpoint` event keeps start pending forever
+ * (each heartbeat also resets the guarded fetch's idle timeout), so the
+ * connect never settled, its stream stayed open, and the pool held its
+ * per-server and global reservation indefinitely, out of reach of eviction.
+ *
+ * WHY ONLY START: a deadline over the whole connect also fired after a
+ * Streamable-HTTP `initialize` had answered, so it closed a transport that
+ * held a live backend session, without the session DELETE, and retried into
+ * a fresh one; it also cut handshakes the SDK allows (`initialize` near its
+ * 60 s limit, then the initialized notification). Start finishes before
+ * `initialize` is sent, so cutting it can strand no backend session, and
+ * every step after start keeps the bound it had before this deadline: the
+ * SDK's timeout on `initialize`, the guarded fetch's idle timeout on the
+ * notification POST.
+ *
+ * WHY THIS VALUE: only SSE start does network I/O, one GET whose first
+ * event is `endpoint`: the TypeScript SDK's SSEServerTransport writes it in
+ * the same call as the response headers, and the Python SDK's `connect_sse`
+ * sends it before any message. That GET's slow legitimate phases have their own
+ * limits: the TCP connect undici's 10 s default (the pinned Agent in
+ * url-guard sets no connect timeout), name resolution glibc's resolver
+ * defaults of 5 s per try and 2 tries. 30 s leaves about 10 s past both for
+ * a backend's first write. STDIO start resolves at the spawn event and
+ * Streamable-HTTP start does no I/O, so neither comes near it.
+ *
+ * A timed-out start takes the ordinary failure path (transport closed,
+ * retried with backoff), so a connect whose starts all hang holds its pool
+ * reservation for at most maxAttempts times this plus the backoff sleeps:
+ * 3 x 30 s + 1 s + 2 s (plus jitter), about 93 s, at the default
+ * MCP_MAX_ATTEMPTS of 3.
+ */
+export const TRANSPORT_START_TIMEOUT_MS = 30_000;
+
+/**
+ * Send the MCP spec's session-termination `DELETE` (with `Mcp-Session-Id`)
+ * to a Streamable-HTTP backend, then let the caller close the transport.
+ *
+ * WHY THIS EXISTS: the SDK's `Protocol.close()` only closes the LOCAL
+ * transport — it never emits the spec DELETE, so every pool teardown left
+ * the backend holding a live session object forever. Measured against a
+ * live deployment: sessions were created and never terminated against a
+ * single backend, roughly a megabyte retained each, walking that backend
+ * into a slow OOM cycle.
+ * The SDK ships `terminateSession()` for exactly this, but its only call
+ * site was the admin-only Inspector DELETE route — never the production
+ * pool.
+ *
+ * FAIL-OPEN BY DESIGN: a backend that is unreachable, hung, or answers
+ * the DELETE with an error must never block or abort pool eviction, so
+ * the call is bounded by `SESSION_TERMINATE_TIMEOUT_MS` and every failure
+ * becomes exactly one WARN naming the server — surfaced, never swallowed
+ * silently, never rethrown into the teardown path.
+ *
+ * SAFE TO CALL TWICE: STDIO and SSE transports carry no HTTP session and
+ * no `terminateSession` method, so they short-circuit on the type check;
+ * and the SDK clears its `_sessionId` after a successful DELETE while
+ * `terminateSession()` returns immediately when there is no session id.
+ * A double teardown (the same `ConnectedClient` reachable as both an idle
+ * and an active slot during an invalidation cascade) therefore sends one
+ * DELETE, not two. A FAILED DELETE deliberately leaves the session id in
+ * place, so a later teardown retries it rather than orphaning the session.
+ */
+const terminateBackendSession = async (
+  transport: Transport,
+  serverParams: ServerParameters,
+): Promise<void> => {
+  if (!(transport instanceof StreamableHTTPClientTransport)) {
+    return;
+  }
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const termination = transport.terminateSession();
+    // Attach a sink handler so a rejection arriving AFTER the timeout has
+    // already won the race can't surface as an unhandled rejection and
+    // take the process down. The race below still observes the original
+    // rejection through `termination` itself.
+    termination.catch(() => {});
+
+    await Promise.race([
+      termination,
+      new Promise<never>((_resolve, reject) => {
+        timeoutHandle = setTimeout(
+          () =>
+            reject(
+              new Error(
+                `Session termination exceeded ${SESSION_TERMINATE_TIMEOUT_MS}ms`,
+              ),
+            ),
+          SESSION_TERMINATE_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } catch (error) {
+    logger.warn(
+      `Failed to terminate backend session for server ${serverParams.name} (${serverParams.uuid}); closing transport anyway:`,
+      error,
+    );
+  } finally {
+    if (timeoutHandle !== undefined) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+};
+
+/**
+ * Bound this transport's `start()` by TRANSPORT_START_TIMEOUT_MS, in place,
+ * before `client.connect(transport)` calls it.
+ *
+ * The SDK calls `start()` from inside `connect`, after wiring its handlers
+ * and before sending `initialize`, so the timer runs for start alone and is
+ * cleared the moment start settles; nothing after start ever runs under it.
+ *
+ * At the deadline this logs one WARN naming the server and the deadline,
+ * then rejects. The rejection surfaces from `client.connect` into the
+ * caller's ordinary connect-failure path, which closes the transport and
+ * retries with backoff, so the transport is closed exactly once, like any
+ * failed attempt's. Closing is the cancellation: SSE aborts its stream
+ * fetch and closes its EventSource. No backend session exists to terminate
+ * first: SSE learns where to post only from the `endpoint` event that never
+ * came, and Streamable HTTP allocates its session in the `initialize`
+ * answer, after start.
+ */
+const boundTransportStart = (
+  transport: Transport,
+  serverParams: ServerParameters,
+): void => {
+  const start = transport.start.bind(transport);
+  transport.start = async () => {
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const starting = start();
+    // An abandoned start can still reject once its transport is closed;
+    // the sink keeps that late rejection from surfacing as an unhandled
+    // one. The race below still observes a rejection that arrives in time.
+    starting.catch(() => {});
+    try {
+      await Promise.race([
+        starting,
+        new Promise<never>((_resolve, reject) => {
+          timeoutHandle = setTimeout(() => {
+            logger.warn(
+              `Transport start for server ${serverParams.name} (${serverParams.uuid}) passed its ${TRANSPORT_START_TIMEOUT_MS}ms deadline; closing its transport`,
+            );
+            reject(
+              new Error(
+                `Transport start exceeded its ${TRANSPORT_START_TIMEOUT_MS}ms deadline`,
+              ),
+            );
+          }, TRANSPORT_START_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
+  };
+};
+
+/**
  * A subscriber invoked when the backend MCP server emits
  * `notifications/tools/list_changed`. The proxy layer (and the pool
  * invalidation path) attach subscribers here to fan that signal out to
@@ -143,10 +327,35 @@ export const transformDockerUrl = (url: string): string => {
   return url;
 };
 
+/**
+ * The guarded outbound fetch for the pooled data plane (SSE and
+ * Streamable-HTTP remote backends).
+ *
+ * Before this, the pool dialed remote backends with the raw global fetch: no
+ * address-range refusal, no redirect re-validation, no DNS pinning, no
+ * response-size or time cap, while the admin Inspector path already went
+ * through the shared url-guard. This closes that asymmetry for the pool.
+ *
+ * The pool's targets are DB-configured internal services, not caller-supplied
+ * URLs like the Inspector's, so `allowPrivateAddresses` permits the
+ * RFC-1918/loopback ranges where they live (the socket is still pinned to the
+ * resolved address and the cloud metadata address is still refused), and
+ * `refuseCrossOriginRedirect` rejects any redirect to another origin outright:
+ * a trusted backend never redirects the gateway elsewhere, and following one
+ * would carry the row's stored bearer to the redirect target, which is the
+ * SSRF vector this closes. The response byte ceiling and idle timeout come
+ * from the guard defaults (MCP_PROXY_MAX_RESPONSE_BYTES,
+ * MCP_PROXY_REQUEST_TIMEOUT_MS).
+ */
+const createPoolGuardedFetch = (): FetchLike =>
+  createGuardedFetch({
+    allowPrivateAddresses: true,
+    refuseCrossOriginRedirect: true,
+  });
+
 export const createMetaMcpClient = (
   serverParams: ServerParameters,
 ): { client: Client | undefined; transport: Transport | undefined } => {
-  assertFantasticalServerIdentity(serverParams);
   let transport: Transport | undefined;
 
   // Create the appropriate transport based on server type
@@ -195,27 +404,35 @@ export const createMetaMcpClient = (
       ...(serverParams.headers || {}),
     };
 
-    // Check for authentication - prioritize OAuth tokens, fallback to bearerToken
+    // Check for authentication - prioritize OAuth tokens, fallback to
+    // bearerToken. The stored bearer is an `enc:v1:` envelope at rest
+    //, so it is decrypted here at the point of use; the
+    // plaintext exists only transiently while the header is built. A row that
+    // cannot be resolved yields no header (fail-closed) rather than a broken
+    // credential.
     const authToken =
-      serverParams.oauth_tokens?.access_token || serverParams.bearerToken;
+      serverParams.oauth_tokens?.access_token ||
+      resolveServerBearerToken(serverParams.bearerToken);
     if (authToken) {
       headers["Authorization"] = `Bearer ${authToken}`;
     }
 
-    const hasHeaders = Object.keys(headers).length > 0;
-
-    if (!hasHeaders) {
-      transport = new SSEClientTransport(new URL(transformedUrl));
-    } else {
-      transport = new SSEClientTransport(new URL(transformedUrl), {
-        requestInit: {
-          headers,
-        },
-        eventSourceInit: {
-          fetch: (url, init) => fetch(url, { ...init, headers }),
-        },
-      });
-    }
+    // Every request this transport makes goes through the guarded, pinned
+    // fetch, not just the initial GET: the SSE POST back-channel targets the
+    // endpoint the REMOTE server advertises in its `endpoint` event, which is
+    // remote-controlled input the pool never sees otherwise. eventSourceInit
+    // .fetch takes precedence over the `fetch` option inside the SDK, so both
+    // are set for the stream GET and the back-channel POSTs to be covered.
+    const guardedFetch = createPoolGuardedFetch();
+    transport = new SSEClientTransport(new URL(transformedUrl), {
+      eventSourceInit: {
+        fetch: (url, init) => guardedFetch(url, { ...init, headers }),
+      },
+      requestInit: {
+        headers,
+      },
+      fetch: guardedFetch,
+    });
   } else if (serverParams.type === "STREAMABLE_HTTP" && serverParams.url) {
     // Transform the URL if TRANSFORM_LOCALHOST_TO_DOCKER_INTERNAL is set to "true"
     const transformedUrl = transformDockerUrl(serverParams.url);
@@ -225,31 +442,43 @@ export const createMetaMcpClient = (
       ...(serverParams.headers || {}),
     };
 
-    // Check for authentication - prioritize OAuth tokens, fallback to bearerToken
+    // Check for authentication - prioritize OAuth tokens, fallback to
+    // bearerToken. The stored bearer is an `enc:v1:` envelope at rest
+    //, so it is decrypted here at the point of use; the
+    // plaintext exists only transiently while the header is built. A row that
+    // cannot be resolved yields no header (fail-closed) rather than a broken
+    // credential.
     const authToken =
-      serverParams.oauth_tokens?.access_token || serverParams.bearerToken;
+      serverParams.oauth_tokens?.access_token ||
+      resolveServerBearerToken(serverParams.bearerToken);
     if (authToken) {
       headers["Authorization"] = `Bearer ${authToken}`;
     }
 
-    const hasHeaders = Object.keys(headers).length > 0;
+    // Guarded, pinned outbound fetch (see createPoolGuardedFetch), covering
+    // the transport's own reconnects and every redirect hop the one-shot
+    // connect check cannot reach.
+    const guardedFetch = createPoolGuardedFetch();
 
-    // M365 delegated broker: servers configured for per-user Graph
-    // token injection get a custom fetch that stamps a freshly minted
-    // per-user Authorization onto EVERY outgoing request (and strips
-    // any connection-level credential). Request-scoped — survives pool
-    // idle-handoff/cap-reuse without cross-user token leakage. See
+    // M365 delegated broker: servers configured for per-user Graph token
+    // injection get a fetch that stamps a freshly minted per-user
+    // Authorization onto EVERY outgoing request (and strips any
+    // connection-level credential), request-scoped so it survives pool
+    // idle-handoff/cap-reuse without cross-user token leakage. It wraps the
+    // guarded fetch: injection sets the header, then the guarded fetch
+    // validates + pins + caps the actual connection. See
     // `lib/m365/injected-fetch.ts` for the invariant.
-    const injectedFetch = getInjectedFetchForServer(serverParams.name);
+    const injectedFetch = getInjectedFetchForServer(
+      serverParams.name,
+      guardedFetch,
+    );
 
-    if (!hasHeaders && !injectedFetch) {
-      transport = new StreamableHTTPClientTransport(new URL(transformedUrl));
-    } else {
-      transport = new StreamableHTTPClientTransport(new URL(transformedUrl), {
-        ...(hasHeaders ? { requestInit: { headers } } : {}),
-        ...(injectedFetch ? { fetch: injectedFetch } : {}),
-      });
-    }
+    transport = new StreamableHTTPClientTransport(new URL(transformedUrl), {
+      requestInit: {
+        headers,
+      },
+      fetch: injectedFetch ?? guardedFetch,
+    });
   } else {
     metamcpLogStore.addLog(
       serverParams.name,
@@ -274,22 +503,52 @@ export const createMetaMcpClient = (
       capabilities: {},
     },
   );
-  // This is the only construction point for pooled upstream clients. Guard the
-  // request method here so proxy, OpenAPI, retries, and new sessions share it.
-  installFantasticalRequestGuard(client, serverParams);
   return { client, transport };
 };
+
+/**
+ * Test-only injection seam. Production callers (the pool) omit `deps` and
+ * get the real transport factory; unit tests supply a fake `createClient`
+ * so the retry loop, the `closing` guard and the M365 broker
+ * short-circuit are exercisable without live network I/O or a real SDK
+ * transport. Mirrors the injectable-deps convention already used by
+ * `makeM365InjectedFetch` and `buildM365BrokerErrorResult`.
+ */
+export interface ConnectMetaMcpClientDeps {
+  createClient?: typeof createMetaMcpClient;
+}
+
+/**
+ * M365 broker codes that represent a DETERMINISTIC per-user identity
+ * rejection on the connect-time mint — retrying can never change this
+ * user's outcome, so a connect that hits one of these short-circuits to a
+ * single attempt (see the catch block below). Deliberately every code
+ * EXCEPT `mint_failed`: mint-service throws `mint_failed` for TRANSIENT
+ * operational failures — the token-endpoint being unreachable
+ * (mint-service.ts's network-error catch) or answering 5xx / a
+ * non-grant error (mint-service.ts's `classifyRefreshFailure`, the
+ * ">=500 || !body.error" and "invalid_client/invalid_request" branches).
+ * Pre-Track-A5 those retried with the normal backoff schedule — free
+ * resilience against a brief Entra blip — and that must be preserved, not
+ * collapsed into the same one-attempt short-circuit as the deterministic
+ * codes.
+ */
+const NON_RETRYABLE_M365_BROKER_CODES: ReadonlySet<M365BrokerErrorCode> =
+  new Set([
+    "credential_missing",
+    "credential_expired",
+    "credential_revoked",
+    "mfa_required",
+    "not_configured",
+  ]);
 
 export const connectMetaMcpClient = async (
   serverParams: ServerParameters,
   onProcessCrash?: (exitCode: number | null, signal: string | null) => void,
   onTransportDrop?: TransportDropCallback,
+  deps: ConnectMetaMcpClientDeps = {},
 ): Promise<ConnectedClient | undefined> => {
-  // Native consent must not cause a reconnect/prompt loop.
-  const protectedFantastical = isFantasticalCandidate(serverParams);
-  if (protectedFantastical) {
-    serverErrorTracker.setServerMaxAttempts(serverParams.uuid, 1);
-  }
+  const createClient = deps.createClient ?? createMetaMcpClient;
   // Get max attempts from server error tracker instead of hardcoding
   const maxAttempts = await serverErrorTracker.getServerMaxAttempts(
     serverParams.uuid,
@@ -304,6 +563,17 @@ export const connectMetaMcpClient = async (
   while (retry) {
     let transport: Transport | undefined;
     let client: Client | undefined;
+    // Hoisted to loop scope (was declared inside the try) so the catch
+    // block can set it before its cleanup `transport.close()` — that
+    // intentional teardown must not masquerade as an unexpected backend
+    // drop (see the catch below). Reset each attempt: a fresh transport
+    // starts un-closing.
+    let closing = false;
+    // When the `initialize` handshake completed. `undefined` = never
+    // established, which lets the drop handlers tell an established-then-
+    // dropped socket (container replace) from a connect-time failure
+    // (backend down) that the connect-attempt log already covers.
+    let connectedAt: number | undefined;
 
     try {
       // Check if server is already in error state before attempting connection
@@ -318,7 +588,7 @@ export const connectMetaMcpClient = async (
       }
 
       // Create fresh client and transport for each attempt
-      const result = createMetaMcpClient(serverParams);
+      const result = createClient(serverParams);
       client = result.client;
       transport = result.transport;
 
@@ -356,12 +626,18 @@ export const connectMetaMcpClient = async (
       // recovery cascade. Idle pool entries that sit dead because no
       // request hit them are the failure mode this closes.
       //
-      // Defensive: the SDK may invoke `onclose` after we've already
-      // torn down via `cleanup()`. The `closing` flag (set inside
-      // cleanup) lets us distinguish "we asked it to close" from "the
-      // remote dropped us", so we don't double-fire the cascade
-      // during normal shutdown.
-      let closing = false;
+      // Two guards keep these handlers from firing spurious "backend
+      // drop" noise:
+      //   - `closing`: the SDK may invoke `onclose` after WE tore the
+      //     transport down (normal `cleanup()`, or the connect-failure
+      //     cleanup in the catch below). An intentional close is not a
+      //     drop, so suppress it.
+      //   - `connectedAt === undefined`: a transport that never finished
+      //     `initialize` isn't an established connection that "dropped" —
+      //     it's a connect-time failure, already surfaced by the
+      //     connect-attempt log in the catch (with the unwrapped cause).
+      //     Firing the drop path here would double-log it and invalidate
+      //     a pool entry that doesn't exist yet.
       const isHttpTransport =
         transport instanceof SSEClientTransport ||
         transport instanceof StreamableHTTPClientTransport;
@@ -378,18 +654,19 @@ export const connectMetaMcpClient = async (
               chainError,
             );
           }
-          if (closing) {
+          if (closing || connectedAt === undefined) {
             return;
           }
+          const age = formatConnectionAge(connectedAt);
           logger.info(
-            `Transport closed unexpectedly for server ${serverParams.name} (${serverParams.uuid})`,
+            `Transport closed unexpectedly for server ${serverParams.name} (${serverParams.uuid}) — ${age}`,
           );
           metamcpLogStore.record({
             category: "connection",
             serverName: serverParams.name,
             serverUuid: serverParams.uuid,
             level: "warn",
-            message: "Transport closed unexpectedly (backend drop)",
+            message: `Transport closed unexpectedly (backend drop, ${age})`,
           });
           if (onTransportDrop) {
             try {
@@ -413,11 +690,13 @@ export const connectMetaMcpClient = async (
               chainError,
             );
           }
-          if (closing) {
+          if (closing || connectedAt === undefined) {
             return;
           }
+          const age = formatConnectionAge(connectedAt);
+          const detail = describeConnectError(transportError);
           logger.warn(
-            `Transport error for server ${serverParams.name} (${serverParams.uuid}):`,
+            `Transport error for server ${serverParams.name} (${serverParams.uuid}) — ${detail} (${age}):`,
             transportError,
           );
           metamcpLogStore.record({
@@ -425,7 +704,7 @@ export const connectMetaMcpClient = async (
             serverName: serverParams.name,
             serverUuid: serverParams.uuid,
             level: "warn",
-            message: "Transport error (backend drop)",
+            message: `Transport error (backend drop, ${detail}, ${age})`,
             error: transportError,
           });
           if (onTransportDrop) {
@@ -441,10 +720,13 @@ export const connectMetaMcpClient = async (
         };
       }
 
-      await client.connect(
-        transport,
-        protectedFantastical ? { timeout: FANTASTICAL_TIMEOUT_MS } : undefined,
-      );
+      // Only start is bounded here: it has no SDK timeout of its own (see
+      // TRANSPORT_START_TIMEOUT_MS). A timeout lands in the catch below.
+      boundTransportStart(transport, serverParams);
+      await client.connect(transport);
+      // Handshake complete — from here a transport close/error is a real
+      // drop of an established connection, not a connect-time failure.
+      connectedAt = Date.now();
 
       metamcpLogStore.record({
         category: "connection",
@@ -495,6 +777,15 @@ export const connectMetaMcpClient = async (
           // during transport teardown can't trigger fan-out against a
           // half-closed proxy server.
           listChangedSubscribers.clear();
+          // Spec session termination MUST precede `close()`: the DELETE
+          // needs the still-live transport (its abort signal and headers),
+          // and `close()` aborts that controller. Every pool teardown site
+          // funnels through this one `cleanup()`, which is why the fix
+          // lives here rather than at the 14 `client.cleanup()` callers in
+          // `mcp-server-pool.ts`.
+          // `closing` is already set above, so the WARN this may emit can
+          // never be mistaken for a backend drop by the transport handlers.
+          await terminateBackendSession(capturedTransport, serverParams);
           await capturedTransport.close();
           await capturedClient.close();
         },
@@ -520,21 +811,72 @@ export const connectMetaMcpClient = async (
         listChangedSubscribers,
       };
     } catch (error) {
-      metamcpLogStore.record({
-        category: "connection",
-        serverName: serverParams.name,
-        serverUuid: serverParams.uuid,
-        level: "error",
-        message: `Connect attempt ${count + 1}/${maxAttempts} failed`,
-        error,
-      });
-      if (protectedFantastical) {
-        // Hold the failed integration for operator review instead of spawning it again.
-        await serverErrorTracker.recordServerCrash(
-          serverParams.uuid,
-          null,
-          null,
-        );
+      // Set the closing guard BEFORE the cleanup close below so an
+      // intentional teardown of a transport that DID establish (a throw
+      // after `connectedAt` was set) isn't logged as an unexpected drop.
+      // The connectedAt guard on the handlers covers the more common
+      // never-established case. Fixes the connect-failure cleanup that
+      // used to close without any guard and logged its own close as a
+      // "backend drop" twice per attempt.
+      closing = true;
+
+      const brokerError = isM365BrokerError(error) ? error : undefined;
+      const nonRetryableBroker =
+        brokerError !== undefined &&
+        NON_RETRYABLE_M365_BROKER_CODES.has(brokerError.code);
+
+      if (nonRetryableBroker) {
+        // brokerError is narrowed non-undefined by nonRetryableBroker.
+        const deterministicError = brokerError as M365BrokerError;
+        // A DETERMINISTIC per-user identity state, not a backend fault.
+        // Retrying can never resolve it and only produces the
+        // "Connect attempt N/N failed" storm the operator saw, so
+        // short-circuit after one attempt. Latch the error into the
+        // request-scoped sink: the outer tools/call handler drains it and
+        // answers the consumer with the enrollment prompt — the same
+        // surface the warm tool-call path already presents. See
+        // recordConnectBrokerFailure + m365/broker-error-result.ts.
+        recordConnectBrokerFailure({
+          serverName: serverParams.name,
+          error: deterministicError,
+        });
+        metamcpLogStore.record({
+          category: "connection",
+          serverName: serverParams.name,
+          serverUuid: serverParams.uuid,
+          level: "info",
+          message: `M365 enrollment required for the connecting user (${deterministicError.code}) — non-retryable; delivering enrollment prompt to caller`,
+        });
+      } else if (brokerError) {
+        // mint_failed: a TRANSIENT operational failure inside mint-service
+        // (network error reaching the token endpoint, or a 5xx / non-grant
+        // response). Falls through to the normal retry-with-backoff below
+        // like any other connect failure — see
+        // NON_RETRYABLE_M365_BROKER_CODES's doc comment for why this code
+        // is excluded from the short-circuit. Logged with the typed
+        // message (not describeConnectError, which is for untyped
+        // network/undici throws) so an operator sees the actionable
+        // "try again shortly" text, not a bare stack.
+        metamcpLogStore.record({
+          category: "connection",
+          serverName: serverParams.name,
+          serverUuid: serverParams.uuid,
+          level: "error",
+          message: `Connect attempt ${count + 1}/${maxAttempts} failed — M365 token mint failed (mint_failed): ${brokerError.message}`,
+          error: brokerError,
+        });
+      } else {
+        // Unwrap undici's nested `.cause` so the log names the actionable
+        // leaf (connect ECONNREFUSED 172.18.0.13:3000) rather than the
+        // generic "fetch failed" / "terminated" wrapper.
+        metamcpLogStore.record({
+          category: "connection",
+          serverName: serverParams.name,
+          serverUuid: serverParams.uuid,
+          level: "error",
+          message: `Connect attempt ${count + 1}/${maxAttempts} failed — ${describeConnectError(error)}`,
+          error,
+        });
       }
 
       // CRITICAL FIX: Clean up transport/process on connection failure
@@ -555,13 +897,34 @@ export const connectMetaMcpClient = async (
       if (client) {
         try {
           await client.close();
-        } catch (cleanupError) {
-          // Client may not be fully initialized, ignore
+        } catch {
+          // Client may not be fully initialized, ignore.
         }
+      }
+
+      // Non-retryable: one attempt only. The pool sees `undefined`
+      // exactly as it does for any failed connect (unchanged contract);
+      // the latched enrollment prompt is what reaches the consumer.
+      if (nonRetryableBroker) {
+        return undefined;
       }
 
       count++;
       retry = count < maxAttempts;
+
+      if (brokerError && !retry) {
+        // mint_failed exhausted every retry. Latch it (same sink the
+        // non-retryable branch uses) so the consumer still gets the typed
+        // "try again shortly" enrollment-adjacent message via
+        // buildM365BrokerErrorResult instead of a generic connect
+        // failure / "Unknown tool" — the informative payload shouldn't be
+        // thrown away just because this code happened to be retryable.
+        recordConnectBrokerFailure({
+          serverName: serverParams.name,
+          error: brokerError,
+        });
+      }
+
       if (retry) {
         // Exponential backoff with jitter. See
         // `computeReconnectBackoffMs` doc comment for the schedule.

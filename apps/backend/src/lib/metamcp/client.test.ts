@@ -267,11 +267,15 @@ describe("createMetaMcpClient — STREAMABLE_HTTP transport option wiring", () =
     return internals;
   }
 
-  it("no headers, non-injected server: no requestInit, no custom fetch", () => {
+  it("no headers, non-injected server: empty requestInit, guarded fetch", () => {
+    // Post-#206 wiring: the SSRF-guarded fetch is always installed, and
+    // requestInit is always present (possibly with empty headers).
     vi.stubEnv("M365_INJECTED_SERVER_NAMES", "m365");
     const internals = transportInternals({ name: "autotask" });
-    expect(internals._requestInit).toBeUndefined();
-    expect(internals._fetch).toBeUndefined();
+    expect(internals._requestInit).toEqual(
+      expect.objectContaining({ headers: {} }),
+    );
+    expect(typeof internals._fetch).toBe("function");
   });
 
   it("bearer/header server, non-injected: requestInit carries auth, no custom fetch", () => {
@@ -284,13 +288,16 @@ describe("createMetaMcpClient — STREAMABLE_HTTP transport option wiring", () =
     const headers = internals._requestInit?.headers as Record<string, string>;
     expect(headers.Authorization).toBe("Bearer static-token");
     expect(headers["X-Custom"]).toBe("yes");
-    expect(internals._fetch).toBeUndefined();
+    // Post-#206: the SSRF-guarded fetch wraps even the plain bearer path.
+    expect(typeof internals._fetch).toBe("function");
   });
 
   it("injected server: custom fetch installed even with no headers", () => {
     vi.stubEnv("M365_INJECTED_SERVER_NAMES", "m365");
     const internals = transportInternals({ name: "m365" });
-    expect(internals._requestInit).toBeUndefined();
+    expect(internals._requestInit).toEqual(
+      expect.objectContaining({ headers: {} }),
+    );
     expect(typeof internals._fetch).toBe("function");
   });
 

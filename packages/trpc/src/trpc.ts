@@ -35,3 +35,25 @@ export const protectedProcedure = t.procedure.use(({ ctx, next }) => {
     },
   });
 });
+
+// Fork adaptation: upstream's adminProcedure is built on a users.role RBAC
+// column that this fork does not carry (single-operator deployment). Every
+// authenticated account here IS the operator, so admin today means
+// "authenticated with a session". If this fork ever hosts multiple users,
+// replace this with a real role check before doing anything else.
+export const adminProcedure = t.procedure.use(({ ctx, next }) => {
+  if (!ctx.user || !ctx.session) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message: "You must be logged in to access this resource",
+    });
+  }
+
+  return next({
+    ctx: {
+      ...ctx,
+      user: ctx.user,
+      session: ctx.session,
+    },
+  });
+});

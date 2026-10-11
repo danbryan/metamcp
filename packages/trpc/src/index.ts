@@ -1,6 +1,7 @@
 // Export tRPC setup
 export {
   protectedProcedure,
+  adminProcedure,
   publicProcedure,
   router,
   baseProcedure,
@@ -10,7 +11,7 @@ export type { BaseContext } from "./trpc";
 
 // Export router creators
 export { createAppRouter, createFrontendRouter } from "./router";
-export { createMcpServersRouter } from "./routers/frontend";
+export { createMcpServersRouter, createOAuthRouter } from "./routers/frontend";
 
 // Export all zod types for convenience
 export * from "@repo/zod-types";

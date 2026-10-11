@@ -50,7 +50,7 @@ vi.mock("@/utils/logger", () => ({
 const h = vi.hoisted(() => {
   const state = {
     /** Session the mocked auth middleware attaches; null = signed out. */
-    sessionUser: null as { id?: string; role?: string } | null,
+    sessionUser: null as { id?: string; email?: string } | null,
     /** Every sub-router handler that actually ran. */
     handlerCalls: [] as string[],
   };
@@ -154,13 +154,23 @@ beforeEach(() => {
   h.state.handlerCalls.length = 0;
 });
 
-const signInAs = (role: string | undefined, id = "user-1") => {
-  h.state.sessionUser = role === undefined ? { id } : { id, role };
+const ADMIN_EMAIL = "operator@example.com";
+
+const signInAs = (email: string | undefined, id = "user-1") => {
+  h.state.sessionUser = email === undefined ? { id } : { id, email };
 };
 
-describe("/mcp-proxy — member-role RCE gate", () => {
-  it("rejects a member on the STDIO spawn route without reaching the handler", async () => {
-    signInAs("member");
+beforeAll(() => {
+  process.env.METAMCP_ADMIN_EMAILS = ADMIN_EMAIL;
+});
+
+afterAll(() => {
+  delete process.env.METAMCP_ADMIN_EMAILS;
+});
+
+describe("/mcp-proxy — operator gate (RCE surface)", () => {
+  it("rejects a non-operator on the STDIO spawn route without reaching the handler", async () => {
+    signInAs("someone@example.com");
 
     const response = await fetch(`${baseUrl}${RCE_PATH}`);
 
@@ -170,8 +180,8 @@ describe("/mcp-proxy — member-role RCE gate", () => {
     expect(h.state.handlerCalls).toEqual([]);
   });
 
-  it("lets an admin through to the STDIO route", async () => {
-    signInAs("admin");
+  it("lets the operator through to the STDIO route", async () => {
+    signInAs(ADMIN_EMAIL);
 
     const response = await fetch(`${baseUrl}${RCE_PATH}`);
 
@@ -179,8 +189,8 @@ describe("/mcp-proxy — member-role RCE gate", () => {
     expect(h.state.handlerCalls).toEqual(["server:GET /stdio"]);
   });
 
-  it("rejects a member on DELETE /server/mcp (was session-only, not admin-only)", async () => {
-    signInAs("member");
+  it("rejects a non-operator on DELETE /server/mcp", async () => {
+    signInAs("someone@example.com");
 
     const response = await fetch(`${baseUrl}/mcp-proxy/server/mcp`, {
       method: "DELETE",
@@ -191,8 +201,8 @@ describe("/mcp-proxy — member-role RCE gate", () => {
     expect(h.state.handlerCalls).toEqual([]);
   });
 
-  it("lets an admin through to DELETE /server/mcp", async () => {
-    signInAs("admin");
+  it("lets the operator through to DELETE /server/mcp", async () => {
+    signInAs(ADMIN_EMAIL);
 
     const response = await fetch(`${baseUrl}/mcp-proxy/server/mcp`, {
       method: "DELETE",
@@ -224,8 +234,8 @@ describe("/mcp-proxy — whole-surface coverage", () => {
     ["GET", "/mcp-proxy/metamcp/info"],
   ];
 
-  it.each(surface)("member gets 403 on %s %s", async (method, path) => {
-    signInAs("member");
+  it.each(surface)("non-operator gets 403 on %s %s", async (method, path) => {
+    signInAs("someone@example.com");
 
     const response = await fetch(`${baseUrl}${path}`, { method });
 
@@ -233,8 +243,8 @@ describe("/mcp-proxy — whole-surface coverage", () => {
     expect(h.state.handlerCalls).toEqual([]);
   });
 
-  it.each(surface)("admin gets through on %s %s", async (method, path) => {
-    signInAs("admin");
+  it.each(surface)("operator gets through on %s %s", async (method, path) => {
+    signInAs(ADMIN_EMAIL);
 
     const response = await fetch(`${baseUrl}${path}`, { method });
 
@@ -243,8 +253,8 @@ describe("/mcp-proxy — whole-surface coverage", () => {
   });
 });
 
-describe("/mcp-proxy — the gate is fail-closed", () => {
-  it("denies a session whose user carries no role at all", async () => {
+describe("/mcp-proxy — gate edge cases", () => {
+  it("denies a session whose user carries no email at all", async () => {
     signInAs(undefined);
 
     const response = await fetch(`${baseUrl}${RCE_PATH}`);
@@ -253,30 +263,35 @@ describe("/mcp-proxy — the gate is fail-closed", () => {
     expect(h.state.handlerCalls).toEqual([]);
   });
 
-  it("denies an unrecognized role rather than defaulting to allow", async () => {
-    signInAs("superuser");
+  it("matches the operator email case-insensitively", async () => {
+    signInAs(ADMIN_EMAIL.toUpperCase());
 
     const response = await fetch(`${baseUrl}${RCE_PATH}`);
 
-    expect(response.status).toBe(403);
-    expect(h.state.handlerCalls).toEqual([]);
-  });
-
-  it("denies a role that differs from admin only by case", async () => {
-    signInAs("Admin");
-
-    const response = await fetch(`${baseUrl}${RCE_PATH}`);
-
-    expect(response.status).toBe(403);
-    expect(h.state.handlerCalls).toEqual([]);
+    expect(response.status).toBe(200);
+    expect(h.state.handlerCalls).toEqual(["server:GET /stdio"]);
   });
 
   it("still answers 401 (not 403) when there is no session at all", async () => {
     // Order proof: authentication runs before authorization, so an anonymous
-    // caller is stopped by the session check and never reaches the role gate.
+    // caller is stopped by the session check and never reaches the gate.
     const response = await fetch(`${baseUrl}${RCE_PATH}`);
 
     expect(response.status).toBe(401);
     expect(h.state.handlerCalls).toEqual([]);
+  });
+
+  it("allows any authenticated session when METAMCP_ADMIN_EMAILS is unset (single-operator mode)", async () => {
+    delete process.env.METAMCP_ADMIN_EMAILS;
+    try {
+      signInAs("anyone@example.com");
+
+      const response = await fetch(`${baseUrl}${RCE_PATH}`);
+
+      expect(response.status).toBe(200);
+      expect(h.state.handlerCalls).toEqual(["server:GET /stdio"]);
+    } finally {
+      process.env.METAMCP_ADMIN_EMAILS = ADMIN_EMAIL;
+    }
   });
 });

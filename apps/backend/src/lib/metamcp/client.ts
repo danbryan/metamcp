@@ -23,6 +23,12 @@ import { describeConnectError, formatConnectionAge } from "./connect-error";
 import { metamcpLogStore } from "./log-store";
 import { resolveServerBearerToken } from "./server-bearer-crypto";
 import { serverErrorTracker } from "./server-error-tracker";
+import {
+  assertFantasticalServerIdentity,
+  FANTASTICAL_TIMEOUT_MS,
+  installFantasticalRequestGuard,
+  isFantasticalCandidate,
+} from "./server-tool-policy";
 import { createGuardedFetch } from "./url-guard";
 import { resolveEnvVariables } from "./utils";
 
@@ -356,6 +362,7 @@ const createPoolGuardedFetch = (): FetchLike =>
 export const createMetaMcpClient = (
   serverParams: ServerParameters,
 ): { client: Client | undefined; transport: Transport | undefined } => {
+  assertFantasticalServerIdentity(serverParams);
   let transport: Transport | undefined;
 
   // Create the appropriate transport based on server type
@@ -503,6 +510,9 @@ export const createMetaMcpClient = (
       capabilities: {},
     },
   );
+  // This is the only construction point for pooled upstream clients. Guard the
+  // request method here so proxy, OpenAPI, retries, and new sessions share it.
+  installFantasticalRequestGuard(client, serverParams);
   return { client, transport };
 };
 
@@ -549,6 +559,11 @@ export const connectMetaMcpClient = async (
   deps: ConnectMetaMcpClientDeps = {},
 ): Promise<ConnectedClient | undefined> => {
   const createClient = deps.createClient ?? createMetaMcpClient;
+  // Native consent must not cause a reconnect/prompt loop.
+  const protectedFantastical = isFantasticalCandidate(serverParams);
+  if (protectedFantastical) {
+    serverErrorTracker.setServerMaxAttempts(serverParams.uuid, 1);
+  }
   // Get max attempts from server error tracker instead of hardcoding
   const maxAttempts = await serverErrorTracker.getServerMaxAttempts(
     serverParams.uuid,
@@ -723,7 +738,10 @@ export const connectMetaMcpClient = async (
       // Only start is bounded here: it has no SDK timeout of its own (see
       // TRANSPORT_START_TIMEOUT_MS). A timeout lands in the catch below.
       boundTransportStart(transport, serverParams);
-      await client.connect(transport);
+      await client.connect(
+        transport,
+        protectedFantastical ? { timeout: FANTASTICAL_TIMEOUT_MS } : undefined,
+      );
       // Handshake complete — from here a transport close/error is a real
       // drop of an established connection, not a connect-time failure.
       connectedAt = Date.now();
@@ -877,6 +895,15 @@ export const connectMetaMcpClient = async (
           message: `Connect attempt ${count + 1}/${maxAttempts} failed — ${describeConnectError(error)}`,
           error,
         });
+      }
+
+      if (protectedFantastical) {
+        // Hold the failed integration for operator review instead of spawning it again.
+        await serverErrorTracker.recordServerCrash(
+          serverParams.uuid,
+          null,
+          null,
+        );
       }
 
       // CRITICAL FIX: Clean up transport/process on connection failure

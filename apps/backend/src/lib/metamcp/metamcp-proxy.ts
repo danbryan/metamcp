@@ -516,7 +516,7 @@ export const createServer = async (
 
         // Find the server with the matching name prefix
         for (const [mcpServerUuid, params] of Object.entries(serverParams)) {
-          // Do not wait for unrelated providers on a cold suggestions call.
+          // Do not wait for unrelated providers on a cold Fantastical call.
           if (
             serverPrefix === FANTASTICAL_SERVER_NAME &&
             mcpServerUuid !== FANTASTICAL_SERVER_UUID

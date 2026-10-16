@@ -44,7 +44,7 @@ describe("Fantastical real namespace override boundary", () => {
         {
           method: "tools/call",
           params: {
-            name: "fantastical-suggestions__createCalendarItem",
+            name: "fantastical__deleteCalendarItem",
             arguments: {},
           },
         },
@@ -69,7 +69,7 @@ describe("Fantastical real namespace override boundary", () => {
   it("rejects cross-provider alias targets on both database and warm-cache paths", async () => {
     rows([
       {
-        serverName: "fantastical-suggestions",
+        serverName: "fantastical",
         originalName: "findAvailableTimes",
       },
     ]);
@@ -98,7 +98,7 @@ describe("Fantastical real namespace override boundary", () => {
       inputSchema: { type: "object" as const },
     };
     const handler = createToolOverridesListToolsMiddleware()(async () => ({
-      tools: [safe, { ...safe, name: "fantastical-suggestions__futureWrite" }],
+      tools: [safe, { ...safe, name: "fantastical__futureWrite" }],
     }));
     const result = await handler({ method: "tools/list" }, context);
     expect(result.tools).toEqual([safe]);

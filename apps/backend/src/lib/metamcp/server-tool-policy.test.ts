@@ -86,7 +86,14 @@ describe("Fantastical pooled client policy", () => {
       params: { cursor: "old" },
     });
     expect(list.nextCursor).toBe("next");
-    expect(list.tools).toHaveLength(1);
+    expect(list.tools.map((t: any) => t.name)).toEqual([
+      "findAvailableTimes",
+      "createCalendarItem",
+      "modifyCalendarItem",
+      "queryCalendarSets",
+      "queryCalendars",
+      "queryCalendarItems",
+    ]);
     expect(list.tools[0]).toMatchObject({
       name: "findAvailableTimes",
       title: "Find available times",
@@ -105,17 +112,55 @@ describe("Fantastical pooled client policy", () => {
       const: "tomorrow",
     });
     expect(JSON.stringify(list.tools[0])).not.toContain("delete");
+    expect(list.tools[1].description).toContain("calendarId is required");
+    expect(list.tools[2].annotations.destructiveHint).toBe(true);
     expect(original).toHaveBeenCalledOnce();
   });
 
   it.each([
-    "createCalendarItem",
-    "modifyCalendarItem",
+    ["findAvailableTimes", { durationMinutes: 30 }],
+    ["queryCalendars", {}],
+    ["queryCalendarSets", {}],
+    ["queryCalendarItems", { query: "Dentist" }],
+    ["modifyCalendarItem", { id: "x", title: "y" }],
+    ["createCalendarItem", { description: "Lunch", calendarId: "cal" }],
+  ])("dispatches allowed tool %p", async (name, args) => {
+    const { client, original } = guarded();
+    await expect(
+      (client as any).request({
+        method: "tools/call",
+        params: { name, arguments: args },
+      }),
+    ).resolves.toEqual({ ok: "tools/call" });
+    expect(original).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    undefined,
+    {},
+    { calendarId: "" },
+    { calendarId: "  " },
+    { calendarId: 7 },
+  ])("refuses createCalendarItem without a calendarId %p", async (args) => {
+    const { client, original } = guarded();
+    const result: any = await (client as any).request({
+      method: "tools/call",
+      params: {
+        name: "createCalendarItem",
+        arguments: args && { description: "Lunch", ...args },
+      },
+    });
+    expect(result).toMatchObject({ isError: true });
+    expect(result.content[0].text).toContain("needs calendarId");
+    expect(original).not.toHaveBeenCalled();
+  });
+
+  it.each([
     "deleteCalendarItem",
-    "queryCalendarSets",
-    "queryCalendars",
-    "queryCalendarItems",
     "futureTool",
+    "toString",
+    "__proto__",
+    "constructor",
     "findavailabletimes",
     " findAvailableTimes",
     "findAvailableTimes ",
@@ -225,12 +270,15 @@ describe("Fantastical pooled client policy", () => {
   it("filters stale reserved catalog entries without database state", () => {
     expect(
       filterFantasticalQualifiedTools([
-        { name: "fantastical-suggestions__createCalendarItem" },
-        { name: "fantastical-suggestions__findAvailableTimes" },
+        { name: "fantastical__deleteCalendarItem" },
+        { name: "fantastical__findAvailableTimes" },
+        { name: "fantastical__createCalendarItem" },
+        { name: "fantastical" },
         { name: "other__createEvent" },
       ]),
     ).toEqual([
-      { name: "fantastical-suggestions__findAvailableTimes" },
+      { name: "fantastical__findAvailableTimes" },
+      { name: "fantastical__createCalendarItem" },
       { name: "other__createEvent" },
     ]);
   });

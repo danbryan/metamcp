@@ -4,13 +4,85 @@ import { ServerParameters } from "@repo/zod-types";
 import logger from "@/utils/logger";
 
 export const FANTASTICAL_SERVER_UUID = "646228d4-3167-4be1-b3ee-615f8d5c43c2";
-export const FANTASTICAL_SERVER_NAME = "fantastical-suggestions";
+export const FANTASTICAL_SERVER_NAME = "fantastical";
 export const FANTASTICAL_TOOL_NAME = "findAvailableTimes";
 export const FANTASTICAL_TIMEOUT_MS = 15_000;
 export const FANTASTICAL_COMMAND =
   "/Applications/Fantastical.app/Contents/Helpers/FantasticalMCP.app/Contents/MacOS/FantasticalMCP";
 export const FANTASTICAL_QUALIFIED_PREFIX = `${FANTASTICAL_SERVER_NAME}__`;
 export const FANTASTICAL_QUALIFIED_TOOL_NAME = `${FANTASTICAL_QUALIFIED_PREFIX}${FANTASTICAL_TOOL_NAME}`;
+
+const READ_ONLY = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+
+// Public metadata is fixed here; upstream descriptions never reach agents.
+// deleteCalendarItem is deliberately absent: deletes go through the owning
+// Google or Microsoft provider.
+export const FANTASTICAL_TOOLS: Record<
+  string,
+  { title: string; description: string; annotations: Record<string, boolean> }
+> = {
+  queryCalendars: {
+    title: "List calendars",
+    description:
+      "List every calendar Fantastical sees across Dan's accounts (personal Google, Cosmos Labs Google, Bryanlabs Exchange, iCloud, booking calendars) with id, title, source and whether it is writable. Use the ids for calendarId arguments.",
+    annotations: READ_ONLY,
+  },
+  queryCalendarSets: {
+    title: "List calendar sets",
+    description:
+      "List Fantastical calendar sets (named groups of calendars) with their member calendar ids. Use a set id to scope searches, conflicts or history.",
+    annotations: READ_ONLY,
+  },
+  queryCalendarItems: {
+    title: "Search events and tasks",
+    description:
+      "Find events and tasks by case-insensitive title substring (query), optionally limited by a concrete date range (when, include the year) and by calendarId or calendarSetId (not both). Without a scope it searches the app's current calendar set. Returns item ids for modifyCalendarItem.",
+    annotations: READ_ONLY,
+  },
+  findAvailableTimes: {
+    title: "Find available times",
+    description:
+      "Suggest conflict-free times for durationMinutes (required), with optional natural-language when window (include the year) and title. suggestedTimes are best-first; openTimes are the free stretches. Scope conflicts and pattern history with conflictCalendarId/conflictCalendarSetId and historyCalendarId/historyCalendarSetId; when omitted the app's current calendar set is used. Suggestions only: nothing is reserved. Present times in the user's timezone.",
+    annotations: READ_ONLY,
+  },
+  createCalendarItem: {
+    title: "Create an event or task",
+    description:
+      "Create an event or task from a compact natural-language description (for example 'Dentist Tue Oct 20 2026 2pm for 1 hour'), with optional location and type. calendarId is required by gateway policy: pick the owning calendar with queryCalendars first. There is no attendees field: anything that invites other people goes through the owning Google or Microsoft provider instead. If the time conflicts, ask the user before creating.",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  modifyCalendarItem: {
+    title: "Update an event or task",
+    description:
+      "Change the title, time (when, include the year) or location of an existing item by id from queryCalendarItems. Omitted fields stay unchanged; an empty location removes it. If the new time conflicts, ask the user first. Deleting is not available here.",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+};
+
+const FANTASTICAL_QUALIFIED_TOOL_NAMES = new Set(
+  Object.keys(FANTASTICAL_TOOLS).map(
+    (name) => `${FANTASTICAL_QUALIFIED_PREFIX}${name}`,
+  ),
+);
+
+function isAllowedFantasticalTool(value: unknown): value is string {
+  return typeof value === "string" && Object.hasOwn(FANTASTICAL_TOOLS, value);
+}
 
 export class FantasticalPolicyError extends Error {
   readonly nonrecoverable = true;
@@ -29,7 +101,9 @@ export function isReservedFantasticalName(value: unknown): value is string {
 }
 
 export function isAllowedFantasticalQualifiedName(value: unknown): boolean {
-  return value === FANTASTICAL_QUALIFIED_TOOL_NAME;
+  return (
+    typeof value === "string" && FANTASTICAL_QUALIFIED_TOOL_NAMES.has(value)
+  );
 }
 
 export function filterFantasticalQualifiedTools<T extends { name: unknown }>(
@@ -129,10 +203,9 @@ function stripHiddenSchemaText(value: unknown): unknown {
   );
 }
 
-function schedulingTool(
-  tool: Record<string, unknown>,
-): Record<string, unknown> {
+function publicTool(tool: Record<string, unknown>): Record<string, unknown> {
   const { name, inputSchema, outputSchema, ..._hidden } = tool;
+  const policy = FANTASTICAL_TOOLS[name as string];
   return {
     name,
     ...(inputSchema === undefined
@@ -141,15 +214,9 @@ function schedulingTool(
     ...(outputSchema === undefined
       ? {}
       : { outputSchema: stripHiddenSchemaText(outputSchema) }),
-    title: "Find available times",
-    description:
-      "Suggest conflict-free times for a duration and optional event title/time window, using Fantastical's configured calendars. Unless explicit scope IDs are supplied, history and conflicts use the app's CURRENT calendar set, not necessarily every account. Check that the intended calendars are included and present times in the user's timezone. Suggestions only: this does not reserve or create anything. After the user chooses a time, use the owning Google or Microsoft calendar provider to recheck availability and schedule it.",
-    annotations: {
-      readOnlyHint: true,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
-    },
+    title: policy.title,
+    description: policy.description,
+    annotations: policy.annotations,
   };
 }
 
@@ -189,14 +256,15 @@ export function installFantasticalRequestGuard(
       return {
         ...result,
         tools: (result.tools ?? [])
-          .filter((tool) => tool.name === FANTASTICAL_TOOL_NAME)
-          .map(schedulingTool),
+          .filter((tool) => isAllowedFantasticalTool(tool.name))
+          .map(publicTool),
       } as never;
     }
     if (method === "tools/call") {
       const params = request.params as
         | {
             name?: unknown;
+            arguments?: unknown;
             task?: unknown;
             _meta?: Record<string, unknown>;
           }
@@ -205,13 +273,30 @@ export function installFantasticalRequestGuard(
         !params ||
         typeof params !== "object" ||
         Array.isArray(params) ||
-        params.name !== FANTASTICAL_TOOL_NAME ||
+        !isAllowedFantasticalTool(params.name) ||
         "task" in params ||
         params._meta?.["io.modelcontextprotocol/related-task"] !== undefined
       ) {
         throw new FantasticalPolicyError(
-          "Fantastical policy permits only findAvailableTimes without task augmentation",
+          "Fantastical policy permits only its listed calendar tools without task augmentation",
         );
+      }
+      if (params.name === "createCalendarItem") {
+        const callArgs = params.arguments as
+          | Record<string, unknown>
+          | undefined;
+        const calendarId = callArgs?.calendarId;
+        if (typeof calendarId !== "string" || calendarId.trim() === "") {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text: "createCalendarItem needs calendarId. Choose the owning calendar with queryCalendars (ask the user when it is unclear whether the item is personal or which work account it belongs to), then call again.",
+              },
+            ],
+          } as never;
+        }
       }
       const options = args[2] ?? {};
       args[2] = {
@@ -227,18 +312,17 @@ export function installFantasticalRequestGuard(
         resetTimeoutOnProgress: false,
       };
       const started = performance.now();
-      logger.info(
-        "[Fantastical policy] Dispatching read-only suggestions request",
-      );
+      const toolName = params.name;
+      logger.info(`[Fantastical policy] Dispatching ${toolName}`);
       try {
         const result = await originalRequest(...args);
         logger.info(
-          `[Fantastical policy] Suggestions response in ${Math.round(performance.now() - started)}ms`,
+          `[Fantastical policy] ${toolName} response in ${Math.round(performance.now() - started)}ms`,
         );
         return result;
       } catch {
         logger.warn(
-          `[Fantastical policy] Suggestions request failed after ${Math.round(performance.now() - started)}ms; not retried`,
+          `[Fantastical policy] ${toolName} failed after ${Math.round(performance.now() - started)}ms; not retried`,
         );
         // A tool error result must not enter the gateway's transport-retry cascade.
         return {
@@ -246,7 +330,7 @@ export function installFantasticalRequestGuard(
           content: [
             {
               type: "text",
-              text: "Fantastical did not return a usable suggestion response. No automatic retry was made. Inspect the native integration before retrying.",
+              text: "Fantastical did not return a usable response. No automatic retry was made, because a create or modify may already have happened. Check the calendar with queryCalendarItems before retrying.",
             },
           ],
         } as never;

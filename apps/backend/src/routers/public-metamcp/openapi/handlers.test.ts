@@ -134,7 +134,7 @@ describe("OpenAPI bridge — tools/call recovery cascade", () => {
 
   it("routes a cold Fantastical request without touching unrelated providers", async () => {
     const uuid = "646228d4-3167-4be1-b3ee-615f8d5c43c2";
-    fakeServerParams[uuid] = { name: "fantastical-suggestions" };
+    fakeServerParams[uuid] = { name: "fantastical" };
     const success = { content: [{ type: "text", text: "suggestions" }] };
     const target = makeFakeSession(vi.fn().mockResolvedValue(success));
     getSessionMock.mockImplementation(async (_session, serverUuid) => {
@@ -147,7 +147,7 @@ describe("OpenAPI bridge — tools/call recovery cascade", () => {
         {
           method: "tools/call",
           params: {
-            name: "fantastical-suggestions__findAvailableTimes",
+            name: "fantastical__findAvailableTimes",
             arguments: { durationMinutes: 30 },
           },
         },

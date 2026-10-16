@@ -227,6 +227,13 @@ export function installFantasticalRequestGuard(
   if (!isFantasticalCandidate(server)) return;
   const originalRequest = client.request.bind(client) as Client["request"];
   const canonical = isCanonicalFantastical(server);
+  // The helper answers one call per connection at a time; a concurrent call fails after 20s.
+  let previousCall: Promise<unknown> = Promise.resolve();
+  const serializedRequest = ((...args: Parameters<Client["request"]>) => {
+    const call = previousCall.then(() => originalRequest(...args));
+    previousCall = call.catch(() => undefined);
+    return call;
+  }) as Client["request"];
 
   client.request = (async (...args: Parameters<Client["request"]>) => {
     const [request] = args as unknown as [
@@ -315,7 +322,7 @@ export function installFantasticalRequestGuard(
       const toolName = params.name;
       logger.info(`[Fantastical policy] Dispatching ${toolName}`);
       try {
-        const result = await originalRequest(...args);
+        const result = await serializedRequest(...args);
         logger.info(
           `[Fantastical policy] ${toolName} response in ${Math.round(performance.now() - started)}ms`,
         );

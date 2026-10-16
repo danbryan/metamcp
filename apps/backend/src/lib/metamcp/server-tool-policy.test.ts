@@ -252,6 +252,36 @@ describe("Fantastical pooled client policy", () => {
     },
   );
 
+  it("serializes concurrent tool calls on one helper connection", async () => {
+    const client = new Client(
+      { name: "test", version: "1" },
+      { capabilities: {} },
+    );
+    let active = 0;
+    let peak = 0;
+    const original = vi.fn(async (request: any) => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      active -= 1;
+      if (request.params.arguments.fail) throw new Error("helper failed");
+      return { content: [{ type: "text", text: request.params.arguments.query }] };
+    });
+    (client as any).request = original;
+    installFantasticalRequestGuard(client, canonical);
+    const call = (query: string, fail = false) =>
+      (client as any).request({
+        method: "tools/call",
+        params: { name: "queryCalendarItems", arguments: { query, fail } },
+      });
+    const results = await Promise.all([call("a"), call("b", true), call("c")]);
+    expect(peak).toBe(1);
+    expect(original).toHaveBeenCalledTimes(3);
+    expect(results[0].content[0].text).toBe("a");
+    expect(results[1].isError).toBe(true);
+    expect(results[2].content[0].text).toBe("c");
+  });
+
   it("leaves unrelated client.request unchanged by reference", async () => {
     const client = new Client(
       { name: "test", version: "1" },

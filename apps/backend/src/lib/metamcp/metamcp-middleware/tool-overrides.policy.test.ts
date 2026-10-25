@@ -78,7 +78,7 @@ describe("Fantastical real namespace override boundary", () => {
     ).rejects.toBeInstanceOf(FantasticalPolicyError);
     mocked.select.mockClear();
     await expect(
-      mapOverrideNameToOriginal("another__alias", context.namespaceUuid),
+      mapOverrideNameToOriginal("other__alias", context.namespaceUuid),
     ).rejects.toBeInstanceOf(FantasticalPolicyError);
     expect(mocked.select).not.toHaveBeenCalled();
   });
@@ -102,6 +102,52 @@ describe("Fantastical real namespace override boundary", () => {
     }));
     const result = await handler({ method: "tools/list" }, context);
     expect(result.tools).toEqual([safe]);
+    expect(mocked.select).not.toHaveBeenCalled();
+  });
+});
+
+describe("reverse name cache", () => {
+  it("keeps one alias on two servers apart on the call path", async () => {
+    rows([{ serverName: "zoom", originalName: "zoom_get_user" }]);
+    await expect(
+      mapOverrideNameToOriginal("zoom__get_user", context.namespaceUuid),
+    ).resolves.toBe("zoom__zoom_get_user");
+    rows([]);
+    await expect(
+      mapOverrideNameToOriginal("linear__get_user", context.namespaceUuid),
+    ).resolves.toBe("linear__get_user");
+  });
+  it("keeps one alias on two servers apart after tools/list", async () => {
+    rows([
+      {
+        uuid: "server",
+        overrideName: "authenticate",
+        overrideDescription: "",
+        overrideAnnotations: "",
+      },
+    ]);
+    const tool = { inputSchema: { type: "object" as const } };
+    const handler = createToolOverridesListToolsMiddleware()(async () => ({
+      tools: [
+        { ...tool, name: "qbo-bl__qbo_authenticate" },
+        { ...tool, name: "qbo-home__qbo_authenticate" },
+      ],
+    }));
+    const result = await handler({ method: "tools/list" }, context);
+    expect(result.tools.map((t) => t.name).sort()).toEqual([
+      "qbo-bl__authenticate",
+      "qbo-home__authenticate",
+    ]);
+    mocked.select.mockClear();
+    await expect(
+      mapOverrideNameToOriginal("qbo-bl__authenticate", context.namespaceUuid),
+    ).resolves.toBe("qbo-bl__qbo_authenticate");
+    await expect(
+      mapOverrideNameToOriginal(
+        "qbo-home__authenticate",
+        context.namespaceUuid,
+      ),
+    ).resolves.toBe("qbo-home__qbo_authenticate");
     expect(mocked.select).not.toHaveBeenCalled();
   });
 });

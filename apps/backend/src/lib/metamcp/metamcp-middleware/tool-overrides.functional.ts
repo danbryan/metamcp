@@ -64,7 +64,7 @@ function mergeAnnotations(
  */
 class ToolOverridesCache {
   private overrideCache = new Map<string, ToolOverride>();
-  private reverseNameCache = new Map<string, string>(); // overrideName -> originalName
+  private reverseNameCache = new Map<string, string>(); // server + overrideName -> originalName
   private expiry = new Map<string, number>();
   private persistentKeys = new Set<string>(); // keys that never expire
   private ttl: number;
@@ -81,8 +81,14 @@ class ToolOverridesCache {
     return `${namespaceUuid}:${serverName}:${toolName}`;
   }
 
-  private getReverseKey(namespaceUuid: string, overrideName: string): string {
-    return `${namespaceUuid}:${overrideName}`;
+  // Several servers can share a short name (every qbo server's authenticate,
+  // linear and zoom get_user), so the server is part of the key
+  private getReverseKey(
+    namespaceUuid: string,
+    serverName: string,
+    overrideName: string,
+  ): string {
+    return `${namespaceUuid}:${serverName}:${overrideName}`;
   }
 
   get(
@@ -130,23 +136,37 @@ class ToolOverridesCache {
     if (override.overrideName) {
       const reverseKey = this.getReverseKey(
         namespaceUuid,
+        serverName,
         override.overrideName,
       );
       this.reverseNameCache.set(reverseKey, `${serverName}__${toolName}`);
     }
   }
 
-  getOriginalName(namespaceUuid: string, overrideName: string): string | null {
-    const reverseKey = this.getReverseKey(namespaceUuid, overrideName);
+  getOriginalName(
+    namespaceUuid: string,
+    serverName: string,
+    overrideName: string,
+  ): string | null {
+    const reverseKey = this.getReverseKey(
+      namespaceUuid,
+      serverName,
+      overrideName,
+    );
     return this.reverseNameCache.get(reverseKey) || null;
   }
 
   setOriginalName(
     namespaceUuid: string,
+    serverName: string,
     overrideName: string,
     originalName: string,
   ): void {
-    const reverseKey = this.getReverseKey(namespaceUuid, overrideName);
+    const reverseKey = this.getReverseKey(
+      namespaceUuid,
+      serverName,
+      overrideName,
+    );
     this.reverseNameCache.set(reverseKey, originalName);
   }
 
@@ -358,6 +378,7 @@ async function applyToolOverrides(
         if (override.overrideName && useCache) {
           toolOverridesCache.setOriginalName(
             namespaceUuid,
+            parsed.serverName,
             override.overrideName,
             tool.name,
           );
@@ -405,6 +426,7 @@ export async function mapOverrideNameToOriginal(
   if (useCache) {
     const originalName = toolOverridesCache.getOriginalName(
       namespaceUuid,
+      parsed.serverName,
       parsed.originalToolName,
     );
     if (originalName) {
@@ -444,10 +466,11 @@ export async function mapOverrideNameToOriginal(
     if (toolMapping) {
       const originalFullName = `${toolMapping.serverName}__${toolMapping.originalName}`;
 
-      // Cache the reverse mapping using the tool part only
+      // Cache the reverse mapping under this server and the tool part
       if (useCache) {
         toolOverridesCache.setOriginalName(
           namespaceUuid,
+          parsed.serverName,
           parsed.originalToolName,
           originalFullName,
         );
